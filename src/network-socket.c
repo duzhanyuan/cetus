@@ -50,6 +50,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/version.h>
+#include <linux/filter.h>
+
 
 #ifdef HAVE_WRITEV
 #define USE_BUFFERED_NETIO
@@ -72,13 +74,13 @@
 #define E_NET_WOULDBLOCK EWOULDBLOCK
 #endif
 
-#define MAX_QUERY_CACHE_SIZE 65536
 #include "network-socket.h"
 #include "network-mysqld-proto.h"
 #include "network-mysqld-packet.h"
 #include "cetus-util.h"
 #include "network-compress.h"
 #include "glib-ext.h"
+#include "network-ssl.h"
 
 network_socket *
 network_socket_new()
@@ -88,9 +90,12 @@ network_socket_new()
     s = g_new0(network_socket, 1);
 
     s->send_queue = network_queue_new();
+    s->send_queue_compressed = network_queue_new();
+
     s->recv_queue = network_queue_new();
     s->recv_queue_raw = network_queue_new();
     s->recv_queue_uncompress_raw = network_queue_new();
+    s->recv_queue_decrypted_raw = network_queue_new();
 
     s->default_db = g_string_new(NULL);
     s->username = g_string_new(NULL);
@@ -106,9 +111,26 @@ network_socket_new()
 
     s->src = network_address_new();
     s->dst = network_address_new();
-    s->last_visit_time = time(0);
+    s->create_time = time(0);
+    s->update_time = s->create_time;
 
     return s;
+}
+
+void
+network_socket_send_quit_and_free(network_socket *s)
+{
+    int len = NET_HEADER_SIZE + 1;
+    GString *new_packet = g_string_sized_new(len);
+    new_packet->len = NET_HEADER_SIZE;
+    g_string_append_c(new_packet, (char)COM_QUIT);
+    network_mysqld_proto_set_packet_id(new_packet, 0);
+    network_mysqld_proto_set_packet_len(new_packet, 1);
+    g_queue_push_tail(s->send_queue->chunks, new_packet);
+
+    network_socket_write(s, -1);
+
+    network_socket_free(s);
 }
 
 void
@@ -117,16 +139,16 @@ network_socket_free(network_socket *s)
     if (!s)
         return;
 
-    g_debug("%s: network_socket_free:%p", G_STRLOC, s);
-
     if (s->last_compressed_packet) {
         g_string_free(s->last_compressed_packet, TRUE);
         s->last_compressed_packet = NULL;
     }
     network_queue_free(s->send_queue);
+    network_queue_free(s->send_queue_compressed);
     network_queue_free(s->recv_queue);
     network_queue_free(s->recv_queue_raw);
     network_queue_free(s->recv_queue_uncompress_raw);
+    network_queue_free(s->recv_queue_decrypted_raw);
 
     if (s->response)
         network_mysqld_auth_response_free(s->response);
@@ -140,7 +162,9 @@ network_socket_free(network_socket *s)
         g_debug("%s:event del, ev:%p", G_STRLOC, &(s->event));
         event_del(&(s->event));
     }
-
+#ifdef HAVE_OPENSSL
+    network_ssl_free_connection(s);
+#endif
     if (s->fd != -1) {
         closesocket(s->fd);
     }
@@ -366,6 +390,29 @@ network_socket_connect(network_socket *sock)
     return NETWORK_SOCKET_SUCCESS;
 }
 
+#if defined(SO_REUSEPORT)
+#ifdef BPF_ENABLED
+static void attach_bpf(int fd) 
+{
+    struct sock_filter code[] = {
+        /* A = raw_smp_processor_id() */
+        { BPF_LD  | BPF_W | BPF_ABS, 0, 0, SKF_AD_OFF + SKF_AD_CPU },
+        /* return A */
+        { BPF_RET | BPF_A, 0, 0, 0 },
+    };
+    struct sock_fprog p = {
+        .len = 2,
+        .filter = code,
+    };
+
+    if (setsockopt(fd, SOL_SOCKET, SO_ATTACH_REUSEPORT_CBPF, &p, sizeof(p))) {
+        g_critical("%s:failed to set SO_ATTACH_REUSEPORT_CBPF, err:%s",
+                G_STRLOC, strerror(errno));
+    }
+}
+#endif
+#endif
+
 /**
  * connect a socket
  *
@@ -377,7 +424,7 @@ network_socket_connect(network_socket *sock)
  * @see network_address_set_address()
  */
 network_socket_retval_t
-network_socket_bind(network_socket *con)
+network_socket_bind(network_socket *con,  int advanced_mode)
 {
     /* 
      * HPUX:       int setsockopt(int s, int level, int optname, 
@@ -415,6 +462,21 @@ network_socket_bind(network_socket *con)
                            G_STRLOC, con->dst->name->str, g_strerror(errno), errno);
                 return NETWORK_SOCKET_ERROR;
             }
+
+#if defined(SO_REUSEPORT)
+            if (advanced_mode) {
+                g_message("%s:set SO_REUSEPORT for fd:%d", G_STRLOC, con->fd);
+                if (0 != setsockopt(con->fd, SOL_SOCKET, SO_REUSEPORT, SETSOCKOPT_OPTVAL_CAST & val, sizeof(val))) {
+                    g_critical("%s: setsockopt(%s, SOL_SOCKET, SO_REUSEPORT) failed: %s (%d)",
+                            G_STRLOC, con->dst->name->str, g_strerror(errno), errno);
+                    return NETWORK_SOCKET_ERROR;
+                }
+
+#ifdef BPF_ENABLED
+                attach_bpf(con->fd);
+#endif
+            }
+#endif
         }
 
         if (con->dst->addr.common.sa_family == AF_INET6) {
@@ -584,226 +646,6 @@ network_socket_read(network_socket *sock)
     return NETWORK_SOCKET_SUCCESS;
 }
 
-static network_socket_retval_t
-network_socket_compressed_write(network_socket *con, int send_chunks)
-{
-    gssize len;
-    int os_errno;
-
-    if (con->last_compressed_packet) {
-        char *str = con->last_compressed_packet->str + con->compressed_unsend_offset;
-        int unsend_len = con->last_compressed_packet->len - con->compressed_unsend_offset;
-
-        len = send(con->fd, str, unsend_len, 0);
-
-        g_debug("%s: tcp write,  comp:%d, write len:%d", G_STRLOC, (int)unsend_len, (int)len);
-
-        os_errno = errno;
-
-        if (len > 0) {
-            if (len != unsend_len) {
-                g_debug("%s: tcp write len not equal to compressed packet, comp:%d, len:%d",
-                        G_STRLOC, unsend_len, (int)len);
-                con->compressed_unsend_offset = len + con->compressed_unsend_offset;
-                return NETWORK_SOCKET_WAIT_FOR_EVENT;
-            } else {
-                g_string_free(con->last_compressed_packet, TRUE);
-                con->last_compressed_packet = NULL;
-                con->compressed_unsend_offset = 0;
-            }
-        }
-
-        if (-1 == len) {
-            switch (os_errno) {
-            case E_NET_WOULDBLOCK:
-            case EAGAIN:
-                return NETWORK_SOCKET_WAIT_FOR_EVENT;
-            case EPIPE:
-            case E_NET_CONNRESET:
-            case E_NET_CONNABORTED:
-                    /** remote side closed the connection */
-                return NETWORK_SOCKET_ERROR;
-            default:
-                g_message("%s: send(%s, ...) failed: %s", G_STRLOC, con->dst->name->str, g_strerror(errno));
-                return NETWORK_SOCKET_ERROR;
-            }
-        } else if (len == 0) {
-            return NETWORK_SOCKET_ERROR;
-        }
-    }
-
-    if (send_chunks == 0)
-        return NETWORK_SOCKET_SUCCESS;
-
-    gint chunk_count;
-    chunk_count = send_chunks > 0 ? send_chunks : (gint)con->send_queue->chunks->length;
-
-    if (chunk_count == 0)
-        return NETWORK_SOCKET_SUCCESS;
-
-    g_assert_cmpint(chunk_count, >, 0); /* make sure it is never negative */
-
-    z_stream strm;
-    cetus_compress_init(&strm);
-
-    GString *compress_packet = g_string_sized_new(16384);
-
-    network_mysqld_proto_append_packet_len(compress_packet, 0);
-    network_mysqld_proto_append_packet_id(compress_packet, con->compressed_packet_id);
-    con->compressed_packet_id++;
-    network_mysqld_proto_append_packet_len(compress_packet, 0);
-
-    int uncompressed_len = 0, is_too_large = 0;
-
-    GList *chunk;
-    gint chunk_id;
-
-    int need_more_write = 0;
-
-    for (chunk = con->send_queue->chunks->head, chunk_id = 0;
-         chunk && chunk_id < chunk_count; chunk_id++, chunk = chunk->next) {
-        GString *s = chunk->data;
-
-        int end = 0;
-
-        if (!chunk->next || (chunk_id + 1 >= chunk_count)) {
-            end = 1;
-        }
-
-        char *str;
-        int str_len;
-        if (chunk_id == 0) {
-            str = s->str + con->send_queue->offset;
-            str_len = s->len - con->send_queue->offset;
-        } else {
-            str = s->str;
-            str_len = s->len;
-        }
-
-        g_debug("%s: offset:%d, str_len:%d, s->len:%d", G_STRLOC, (int)con->send_queue->offset, str_len, (int)s->len);
-
-        if (!con->do_strict_compress && uncompressed_len < MIN_COMPRESS_LENGTH && end) {
-            g_string_append_len(compress_packet, str, str_len);
-            if (con->send_queue->offset != 0) {
-                g_warning("%s:con->send_queue->offset is not zero here", G_STRLOC);
-            }
-        } else {
-
-            con->do_strict_compress = 1;
-            uncompressed_len += str_len;
-            if (uncompressed_len > PACKET_LEN_MAX) {
-                g_message("%s:too large packet:%d, s->len:%d", G_STRLOC, uncompressed_len, (int)str_len);
-                uncompressed_len -= str_len;
-                str_len = PACKET_LEN_MAX - uncompressed_len;
-                if (str_len == 0) {
-                    cetus_compress(&strm, compress_packet, NULL, 0, 1);
-                    con->send_queue->offset = 0;
-                } else {
-                    uncompressed_len = PACKET_LEN_MAX;
-                    cetus_compress(&strm, compress_packet, str, str_len, 1);
-                    con->send_queue->offset += str_len;
-                }
-                is_too_large = 1;
-            } else {
-                cetus_compress(&strm, compress_packet, str, str_len, end);
-                con->send_queue->offset = 0;
-            }
-        }
-
-        if (end || is_too_large) {
-            cetus_compress_end(&strm);
-        }
-
-        con->total_output += str_len;
-
-        if (is_too_large) {
-            need_more_write = 1;
-            break;
-        }
-    }
-
-    int compressed_len = compress_packet->len - NET_HEADER_SIZE - COMP_HEADER_SIZE;
-
-    if (compressed_len > PACKET_LEN_MAX || uncompressed_len > PACKET_LEN_MAX || (is_too_large && uncompressed_len == 0)) {
-        g_warning("%s:too large for compression:%d, compressed len:%d", G_STRLOC, uncompressed_len, compressed_len);
-        g_string_free(compress_packet, TRUE);
-        return NETWORK_SOCKET_ERROR;
-    }
-
-    int i;
-    char *s = compress_packet->str;
-    for (i = 0; i < 3; i++) {
-        s[i] = compressed_len & 0xff;
-        compressed_len >>= 8;
-    }
-
-    s = s + 4;
-    for (i = 0; i < 3; i++) {
-        s[i] = uncompressed_len & 0xff;
-        uncompressed_len >>= 8;
-    }
-
-    i = 0;
-    for (chunk = con->send_queue->chunks->head; chunk;) {
-        if (i >= chunk_id) {
-            break;
-        }
-        GString *s = chunk->data;
-        g_string_free(s, TRUE);
-        g_queue_delete_link(con->send_queue->chunks, chunk);
-        chunk = con->send_queue->chunks->head;
-        i++;
-    }
-
-    g_debug("%s: network socket:%p, send (src:%s, dst:%s) fd:%d",
-            G_STRLOC, con, con->src->name->str, con->dst->name->str, con->fd);
-
-    len = send(con->fd, compress_packet->str, compress_packet->len, 0);
-    os_errno = errno;
-
-    g_debug("%s: tcp write,  comp:%d, write len:%d, total len:%d",
-            G_STRLOC, (int)compress_packet->len, (int)len, con->total_output);
-
-    if (len > 0) {
-        if (len != compress_packet->len) {
-            g_debug("%s: tcp write len not equal to compressed packet, comp:%d, len:%d",
-                    G_STRLOC, (int)compress_packet->len, (int)len);
-            con->last_compressed_packet = compress_packet;
-            con->compressed_unsend_offset = len;
-            return NETWORK_SOCKET_WAIT_FOR_EVENT;
-        } else {
-            g_string_free(compress_packet, TRUE);
-            con->last_compressed_packet = NULL;
-            con->compressed_unsend_offset = 0;
-            if (need_more_write) {
-                return NETWORK_SOCKET_WAIT_FOR_EVENT;
-            }
-        }
-    } else {
-        con->last_compressed_packet = compress_packet;
-        con->compressed_unsend_offset = 0;
-    }
-
-    if (-1 == len) {
-        switch (os_errno) {
-        case E_NET_WOULDBLOCK:
-        case EAGAIN:
-            return NETWORK_SOCKET_WAIT_FOR_EVENT;
-        case EPIPE:
-        case E_NET_CONNRESET:
-        case E_NET_CONNABORTED:
-                /** remote side closed the connection */
-            return NETWORK_SOCKET_ERROR;
-        default:
-            g_message("%s: writev(%s, ...) failed: %s", G_STRLOC, con->dst->name->str, g_strerror(errno));
-            return NETWORK_SOCKET_ERROR;
-        }
-    } else if (len == 0) {
-        return NETWORK_SOCKET_ERROR;
-    }
-
-    return NETWORK_SOCKET_SUCCESS;
-}
 
 /**
  * write data to the socket
@@ -824,7 +666,10 @@ network_socket_write_writev(network_socket *con, int send_chunks)
     if (send_chunks == 0)
         return NETWORK_SOCKET_SUCCESS;
 
-    chunk_count = send_chunks > 0 ? send_chunks : (gint)con->send_queue->chunks->length;
+    network_queue* send_queue = con->do_compress ?
+        con->send_queue_compressed : con->send_queue;
+
+    chunk_count = send_chunks > 0 ? send_chunks : (gint)send_queue->chunks->length;
 
     if (chunk_count == 0)
         return NETWORK_SOCKET_SUCCESS;
@@ -837,15 +682,15 @@ network_socket_write_writev(network_socket *con, int send_chunks)
 
     iov = g_new0(struct iovec, chunk_count);
 
-    for (chunk = con->send_queue->chunks->head, chunk_id = 0;
+    for (chunk = send_queue->chunks->head, chunk_id = 0;
          chunk && chunk_id < chunk_count; chunk_id++, chunk = chunk->next) {
         GString *s = chunk->data;
 
         if (chunk_id == 0) {
-            g_assert(con->send_queue->offset < s->len);
+            g_assert(send_queue->offset < s->len);
 
-            iov[chunk_id].iov_base = s->str + con->send_queue->offset;
-            iov[chunk_id].iov_len = s->len - con->send_queue->offset;
+            iov[chunk_id].iov_base = s->str + send_queue->offset;
+            iov[chunk_id].iov_len = s->len - send_queue->offset;
         } else {
             iov[chunk_id].iov_base = s->str;
             iov[chunk_id].iov_len = s->len;
@@ -883,19 +728,19 @@ network_socket_write_writev(network_socket *con, int send_chunks)
         return NETWORK_SOCKET_ERROR;
     }
 
-    con->send_queue->offset += len;
-    con->send_queue->len -= len;
+    send_queue->offset += len;
+    send_queue->len -= len;
 
     /* check all the chunks which we have sent out */
-    for (chunk = con->send_queue->chunks->head; chunk;) {
+    for (chunk = send_queue->chunks->head; chunk;) {
         GString *s = chunk->data;
 
         if (s->len == 0) {
             g_warning("%s: s->len is zero", G_STRLOC);
         }
 
-        if (con->send_queue->offset >= s->len) {
-            con->send_queue->offset -= s->len;
+        if (send_queue->offset >= s->len) {
+            send_queue->offset -= s->len;
 #if NETWORK_DEBUG_TRACE_IO
             g_debug("%s:output for sock:%p", G_STRLOC, con);
             /* to trace the data we sent to the socket, enable this */
@@ -918,9 +763,9 @@ network_socket_write_writev(network_socket *con, int send_chunks)
                 }
             }
 
-            g_queue_delete_link(con->send_queue->chunks, chunk);
+            g_queue_delete_link(send_queue->chunks, chunk);
 
-            chunk = con->send_queue->chunks->head;
+            chunk = send_queue->chunks->head;
         } else {
             g_debug("%s:wait for event", G_STRLOC);
             return NETWORK_SOCKET_WAIT_FOR_EVENT;
@@ -944,11 +789,7 @@ network_socket_retval_t
 network_socket_write(network_socket *sock, int send_chunks)
 {
     if (sock->socket_type == SOCK_STREAM) {
-        if (sock->do_compress) {
-            return network_socket_compressed_write(sock, send_chunks);
-        } else {
-            return network_socket_write_writev(sock, send_chunks);
-        }
+        return network_socket_write_writev(sock, send_chunks);
     } else {
         g_critical("%s: udp write is not supported", G_STRLOC);
         return NETWORK_SOCKET_ERROR;

@@ -52,17 +52,19 @@
 #include "network-backend.h"
 #include "cetus-error.h"
 
-#define XID_LEN 64
+#define XID_LEN 128
 #define COMPRESS_BUF_SIZE 1048576
 
 typedef enum {
     PROXY_NO_DECISION,
     PROXY_NO_CONNECTION,        /* TODO: this one shouldn't be here, it's not a dicsion */
     PROXY_SEND_QUERY,
+    PROXY_WAIT_QUERY_RESULT,
     PROXY_SEND_RESULT,
     PROXY_SEND_INJECTION,
     PROXY_SEND_NONE,
-    PROXY_IGNORE_RESULT       /** for read_query_result */
+    PROXY_IGNORE_RESULT,       /** for read_query_result */
+    PROXY_CLIENT_QUIT
 } network_mysqld_stmt_ret;
 
 typedef struct network_mysqld_con network_mysqld_con;   /* forward declaration */
@@ -176,6 +178,8 @@ typedef struct {
      */
     NETWORK_MYSQLD_PLUGIN_FUNC(con_cleanup);
 
+    NETWORK_MYSQLD_PLUGIN_FUNC(con_exectute_sql);
+
     NETWORK_MYSQLD_PLUGIN_FUNC(con_timeout);
 } network_mysqld_hooks;
 
@@ -214,52 +218,54 @@ typedef enum {
     ST_INIT = 0,
 
     /**< A connection to a backend is about to be made */
-    ST_CONNECT_SERVER = 1,
+    ST_CONNECT_SERVER,
 
     /**< A handshake packet is to be sent to a client */
-    ST_SEND_HANDSHAKE = 2,
+    ST_SEND_HANDSHAKE,
 
     /**< An authentication packet is to be read from a client */
-    ST_READ_AUTH = 3,
+    ST_READ_AUTH,
+
+    ST_FRONT_SSL_HANDSHAKE,
 
     /**< The result of an authentication attempt is to be sent to a client */
-    ST_SEND_AUTH_RESULT = 4,
+    ST_SEND_AUTH_RESULT,
 
     /**< COM_QUERY packets are to be read from a client */
-    ST_READ_QUERY = 5,
+    ST_READ_QUERY,
 
-    ST_GET_SERVER_CONNECTION_LIST = 6,
+    ST_GET_SERVER_CONNECTION_LIST,
 
     /**< COM_QUERY packets are to be sent to a server */
-    ST_SEND_QUERY = 7,
+    ST_SEND_QUERY,
 
     /**< Result set packets are to be read from a server */
-    ST_READ_QUERY_RESULT = 8,
+    ST_READ_QUERY_RESULT,
 
-    ST_READ_M_QUERY_RESULT = 9,
+    ST_READ_M_QUERY_RESULT,
 
     /**< Result set packets are to be sent to a client */
-    ST_SEND_QUERY_RESULT = 10,
+    ST_SEND_QUERY_RESULT,
 
     /**< The client connection should be closed */
-    ST_CLOSE_CLIENT = 11,
+    ST_CLOSE_CLIENT,
 
-    ST_CLIENT_QUIT = 12,
+    ST_CLIENT_QUIT,
 
     /**
      * < An unrecoverable error occurred, leads to sending a MySQL ERR packet 
      * to the client and closing the client connection
      */
-    ST_SEND_ERROR = 13,
+    ST_SEND_ERROR,
 
     /**
      * < An error occurred (malformed/unexpected packet, 
      * unrecoverable network error), internal state 
      */
-    ST_ERROR = 14,
+    ST_ERROR,
 
     /**< The server connection should be closed */
-    ST_CLOSE_SERVER = 15,
+    ST_CLOSE_SERVER,
 
 } network_mysqld_con_state_t;
 
@@ -338,6 +344,7 @@ struct server_connection_state_t {
     chassis *srv;
     network_connection_pool *pool;
     unsigned int is_multi_stmt_set:1;
+    unsigned int retry_cnt:4;
     guint8 charset_code;
 };
 
@@ -349,7 +356,6 @@ typedef enum {
 typedef enum {
     RM_SUCCESS,
     RM_FAIL,
-    RM_CALL_FAIL
 } result_merge_status_t;
 
 typedef struct result_merge_t {
@@ -361,6 +367,7 @@ typedef struct having_condition_t {
     int rel_type;
     int data_type;
     char *condition_value;
+    int column_index;
 } having_condition_t;
 
 typedef struct mysqld_query_attr_t {
@@ -383,6 +390,10 @@ typedef struct query_cache_item {
 } query_cache_item;
 
 struct query_queue_t;
+
+enum {
+    AUTH_SWITCH = 3, /* for now, value not equal to 0 or 0xff is fine */
+};
 /**
  * get the name of a connection state
  */
@@ -509,11 +520,11 @@ struct network_mysqld_con {
 
     unsigned int is_wait_server:1;  /* first connect to backend failed, retrying */
     unsigned int is_calc_found_rows:1;
-    unsigned int login_failed:1;
     unsigned int is_auto_commit:1;
     unsigned int is_start_tran_command:1;
     unsigned int is_prepared:1;
     unsigned int is_in_transaction:1;
+    unsigned int xa_tran_conflict:1;
     unsigned int is_timeout:1;
     unsigned int is_in_sess_context:1;
     unsigned int is_changed_user_when_quit:1;
@@ -541,6 +552,7 @@ struct network_mysqld_con {
     unsigned int conn_attr_check_omit:1;
     unsigned int buffer_and_send_fake_resp:1;
     unsigned int delay_send_auto_commit:1;
+    unsigned int server_in_tran_and_auto_commit_received;
     unsigned int resp_too_long:1;
     unsigned int rob_other_conn:1;
     unsigned int master_unavailable:1;
@@ -556,7 +568,14 @@ struct network_mysqld_con {
     unsigned int last_record_updated:1;
     unsigned int query_cache_judged:1;
     unsigned int is_client_compressed:1;
+    unsigned int is_admin_client:1;
+    unsigned int direct_answer:1;
+    unsigned int admin_read_merge:1;
+    unsigned int ask_one_worker:1;
+    unsigned int ask_the_given_worker:1;
+    unsigned int is_client_to_be_closed:1;
     unsigned int last_backend_type:2;
+    unsigned int process_index:6;
     unsigned int all_participate_num:8;
 
     unsigned long long xa_id;
@@ -633,12 +652,12 @@ struct network_mysqld_con {
     struct timeval connect_timeout; /* default = 2 s */
     struct timeval read_timeout;    /* default = 10 min */
     struct timeval write_timeout;   /* default = 10 min */
+    struct timeval dist_tran_decided_read_timeout;    /* default = 30 sec */
     struct timeval wait_clt_next_sql;
     char xid_str[XID_LEN];
     char last_backends_type[MAX_SERVER_NUM];
 
     struct sharding_plan_t *sharding_plan;
-    struct query_queue_t *recent_queries;
     void *data;
 };
 
@@ -682,6 +701,10 @@ typedef struct server_session_t {
     network_mysqld_con_dist_tran_state_t dist_tran_state;
     read_write_state state;
     session_attr_flags_t attr_diff;
+
+    guint64 ts_read_query;
+    guint64 ts_read_query_result_last;
+    guint8 query_status;
 } server_session_t;
 
 typedef struct {
@@ -720,15 +743,10 @@ NETWORK_API void network_mysqld_con_reset_command_response_state(network_mysqld_
 NETWORK_API void network_mysqld_con_reset_query_state(network_mysqld_con *con);
 
 /**
- * set groups, delete if already exists
- */
-void network_mysqld_con_set_sharding_plan(network_mysqld_con *con, struct sharding_plan_t *);
-
-/**
  * should be socket 
  */
 NETWORK_API network_socket_retval_t network_mysqld_read(chassis *srv, network_socket *con);
-NETWORK_API network_socket_retval_t network_mysqld_write(chassis *srv, network_socket *con);
+NETWORK_API network_socket_retval_t network_mysqld_write(network_socket *con);
 NETWORK_API network_socket_retval_t network_mysqld_con_get_packet(chassis G_GNUC_UNUSED *chas, network_socket *con);
 
 struct chassis_private {
@@ -738,6 +756,9 @@ struct chassis_private {
     struct cetus_users_t *users;
     struct cetus_variable_t *stats_variables;
     struct cetus_monitor_t *monitor;
+    guint32 thread_id;
+    guint32 max_thread_id;
+    struct cetus_acl_t *acl;
 };
 
 NETWORK_API network_socket_retval_t
@@ -748,19 +769,23 @@ NETWORK_API void send_part_content_to_client(network_mysqld_con *con);
 NETWORK_API void set_conn_attr(network_mysqld_con *con, network_socket *server);
 NETWORK_API int network_mysqld_init(chassis *srv);
 NETWORK_API void network_mysqld_add_connection(chassis *srv, network_mysqld_con *con, gboolean listen);
+gboolean network_mysqld_kill_connection(chassis *srv, guint32 id);
 NETWORK_API void network_mysqld_con_handle(int event_fd, short events, void *user_data);
 NETWORK_API int network_mysqld_queue_append(network_socket *sock, network_queue *queue, const char *data, size_t len);
 NETWORK_API int network_mysqld_queue_append_raw(network_socket *sock, network_queue *queue, GString *data);
 NETWORK_API int network_mysqld_queue_reset(network_socket *sock);
+NETWORK_API void network_mysqld_con_clear_xa_env_when_not_expected(network_mysqld_con *con);
 
 NETWORK_API void network_connection_pool_create_conn(network_mysqld_con *con);
 NETWORK_API void network_connection_pool_create_conns(chassis *srv);
+NETWORK_API void check_and_create_conns_func(int fd, short what, void *arg);
+NETWORK_API void update_time_func(int fd, short what, void *arg);
 
 NETWORK_API void record_xa_log_for_mending(network_mysqld_con *con, network_socket *sock);
 NETWORK_API gboolean shard_set_autocommit(network_mysqld_con *con);
 NETWORK_API gboolean shard_set_charset_consistant(network_mysqld_con *con);
 NETWORK_API gboolean shard_set_default_db_consistant(network_mysqld_con *con);
 NETWORK_API gboolean shard_set_multi_stmt_consistant(network_mysqld_con *con);
-NETWORK_API void shard_build_xa_query(network_mysqld_con *con, server_session_t *ss);
+NETWORK_API int shard_build_xa_query(network_mysqld_con *con, server_session_t *ss);
 
 #endif

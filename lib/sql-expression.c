@@ -295,8 +295,11 @@ sql_expr_is_function(const sql_expr_t *p, const char *name)
     if (name == NULL) {
         return func != NULL;
     } else {
-        if (func) {
-            return strcasecmp(func, name) == 0;
+        if (func && strcasecmp(func, name) == 0) {
+            return TRUE;
+        }
+        if (p->alias && strcmp(p->alias, name) == 0) {
+            return TRUE;
         }
         return FALSE;
     }
@@ -320,6 +323,28 @@ sql_expr_is_dotted_name(const sql_expr_t *p, const char *prefix, const char *suf
             && sql_expr_is_id(p->right, suffix);
     }
     return FALSE;
+}
+
+void sql_expr_get_dotted_names(const sql_expr_t *p, char *db, int db_len,
+                               char *table, int tb_len,
+                               char *col, int col_len)
+{
+    if (p && p->op == TK_DOT) {
+        const sql_expr_t *dot = p;
+        if (p->right->op == TK_DOT) { /* db.table.col */
+            if (db) {
+                strncpy(db, p->left->token_text, db_len);
+            }
+            dot = p->right;
+        }
+
+        if (table && dot->left->token_text) {
+            strncpy(table, dot->left->token_text, tb_len);
+        }
+        if (col && dot->right->token_text) {
+            strncpy(col, dot->right->token_text, col_len);
+        }
+    }
 }
 
 gboolean
@@ -382,33 +407,56 @@ sql_expr_list_find_fullname(sql_expr_list_t *list, const sql_expr_t *expr)
     return NULL;
 }
 
-int
-sql_expr_list_find_aggregate(sql_expr_list_t *list)
+/**
+ * Find first aggregate named `target`, only match function name
+ * Example: target=max will match max(a) or max(b)
+ * if `target` is NULL, find first occurance of any aggregate
+ */
+int sql_expr_list_find_aggregate(sql_expr_list_t *list, const char *target)
 {
-    int i, index = 0;
-    enum sql_func_type_t type;
+    int i;
     for (i = 0; i < list->len; ++i) {
         sql_expr_t *p = g_ptr_array_index(list, i);
-        if (p->op == TK_FUNCTION) {
-            type = sql_func_type(p->token_text);
-            if (type != FT_UNKNOWN) {
-                return 1;
+        if (sql_expr_is_function(p, target)
+            && sql_aggregate_type(p->token_text) != FT_UNKNOWN) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/**
+ * Similar with `sql_exp_list_find_aggregate`, but will also
+ *  match function arguments, and target cannot be NULL
+ * Example: target=max(a) will match max(a)
+ */
+int sql_expr_list_find_exact_aggregate(sql_expr_list_t *list, const char *target, int len)
+{
+    int i;
+    for (i = 0; i < list->len; ++i) {
+        sql_expr_t *p = g_ptr_array_index(list, i);
+        if (p->op == TK_FUNCTION
+            && sql_aggregate_type(p->token_text) != FT_UNKNOWN) {
+            if (strncasecmp(p->start, target, len) == 0) {
+                return i;
+            }
+            if (p->alias && strncmp(p->alias, target, len) == 0) {
+                return i;
             }
         }
     }
-
-    return 0;
+    return -1;
 }
 
 int
 sql_expr_list_find_aggregates(sql_expr_list_t *list, group_aggr_t * aggr_array)
 {
     int i, index = 0;
-    enum sql_func_type_t type;
+    enum sql_aggregate_type_t type;
     for (i = 0; i < list->len; ++i) {
         sql_expr_t *p = g_ptr_array_index(list, i);
         if (p->op == TK_FUNCTION) {
-            type = sql_func_type(p->token_text);
+            type = sql_aggregate_type(p->token_text);
             if (type != FT_UNKNOWN) {
                 if (index < MAX_AGGR_FUNS) {
                     aggr_array[index].pos = i;
@@ -428,8 +476,8 @@ sql_expr_list_free(sql_expr_list_t *list)
         g_ptr_array_free(list, TRUE);
 }
 
-enum sql_func_type_t
-sql_func_type(const char *s)
+enum sql_aggregate_type_t
+sql_aggregate_type(const char *s)
 {
     if (strncasecmp(s, "count", 5) == 0)
         return FT_COUNT;
@@ -589,6 +637,8 @@ sql_insert_free(sql_insert_t *p)
         sql_select_free(p->sel_val);
     if (p->columns)
         sql_id_list_free(p->columns);
+    if (p->update_list)
+        sql_expr_list_free(p->update_list);
     g_free(p);
 }
 

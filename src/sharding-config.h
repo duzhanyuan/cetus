@@ -27,12 +27,15 @@
 
 #include "glib-ext.h"
 #include "cetus-util.h"
+#include "chassis-config.h"
 
-#define SHARD_DATA_TYPE_UNSUPPORTED 0
-#define SHARD_DATA_TYPE_INT 1
-#define SHARD_DATA_TYPE_STR 2
-#define SHARD_DATA_TYPE_DATE 3
-#define SHARD_DATA_TYPE_DATETIME 4
+enum shardkey_type_t {
+    SHARD_DATA_TYPE_UNSUPPORTED=0,
+    SHARD_DATA_TYPE_INT,
+    SHARD_DATA_TYPE_STR,
+    SHARD_DATA_TYPE_DATE,
+    SHARD_DATA_TYPE_DATETIME,
+};
 
 enum sharding_method_t {
     SHARD_METHOD_UNKNOWN = -1,
@@ -50,14 +53,19 @@ typedef struct sharding_partition_t {
     char *value;                /* high range OR hash value */
     char *low_value;            /* low range OR null */
 
+    int hash_count;
     BitArray hash_set[MAX_HASH_VALUE_COUNT / 32];   /* hash values of this partition */
 
     GString *group_name;
-    const sharding_vdb_t *vdb;  /* references the vdb it belongs to */
+
+    enum sharding_method_t method;
+    enum shardkey_type_t key_type;
 } sharding_partition_t;
 
 gboolean sharding_partition_contain_hash(sharding_partition_t *, int);
+void sharding_partition_free(sharding_partition_t *);
 //gboolean sharding_partition_cover_range(sharding_partition_t *, );
+void sharding_partition_to_string(sharding_partition_t *, GString*);
 
 struct sharding_vdb_t {
     int id;
@@ -65,30 +73,36 @@ struct sharding_vdb_t {
     int key_type;
     int logic_shard_num;
     GPtrArray *partitions;      /* GPtrArray<sharding_partition_t *> */
-    GPtrArray *databases;       /* GPtrArray<sharding_database_t *> */
 };
 
+void sharding_vdb_partitions_to_string(sharding_vdb_t* vdb, GString* repr);
+
 struct sharding_table_t {
-    GString *db;
+    GString *schema;
     GString *name;
     GString *pkey;
     int shard_key_type;
-    int logic_shard_num;
-    enum sharding_method_t method;
-    GPtrArray *partitions;      /* GPtrArray<sharding_partition_t *>  ref from VDB */
-
     int vdb_id;
-    struct sharding_vdb_t *vdb;
+    struct sharding_vdb_t *vdb_ref;
 };
 
-GPtrArray *shard_conf_get_table_groups(GPtrArray *groups, char *db, char *table);
+struct single_table_t {         /* single table only resides on 1 group */
+    GString *name;
+    GString *schema;
+    GString *group;
+};
 
-GPtrArray *shard_conf_get_any_group(GPtrArray *groups, char *db, char *table);
+int sharding_key_type(const char *str);
+const char* sharding_key_type_str(int type);
+GPtrArray *shard_conf_get_any_group(GPtrArray *groups, const char *db, const char *table);
 
-GPtrArray *shard_conf_get_all_groups(GPtrArray *groups, const char *db);
+GPtrArray *shard_conf_get_all_groups(GPtrArray *groups);
 
 /* same fixture will get same group */
-GPtrArray *shard_conf_get_fixed_group(GPtrArray *groups, const char *db, guint32 fixture);
+GPtrArray *shard_conf_get_fixed_group(GPtrArray *groups, guint64 fixture);
+
+GPtrArray *shard_conf_get_table_groups(GPtrArray *visited_groups,
+                                       const char *db, const char *table);
 
 gboolean shard_conf_is_shard_table(const char *db, const char *table);
 
@@ -108,10 +122,26 @@ GPtrArray *shard_conf_table_partitions(GPtrArray *partitions, const char *db, co
  * find partition by group name
  * special name "all" will get all groups
  */
-void shard_conf_find_groups(GPtrArray *groups, const char *match, const char *db);
+void shard_conf_find_groups(GPtrArray *groups, const char *match);
 
 gboolean shard_conf_load(char *, int);
 
 void shard_conf_destroy(void);
+
+gboolean shard_conf_add_vdb(sharding_vdb_t* vdb);
+
+sharding_vdb_t *sharding_vdb_new();
+gboolean sharding_vdb_is_valid(sharding_vdb_t *vdb, int num_groups);
+void sharding_vdb_free(sharding_vdb_t *vdb);
+
+gboolean shard_conf_add_sharded_table(sharding_table_t* t);
+
+GList* shard_conf_get_vdb_list();
+GList* shard_conf_get_tables(); /* ! g_list_free() after use */
+GList* shard_conf_get_single_tables();
+gboolean shard_conf_write_json(chassis_config_t* conf_manager);
+
+gboolean shard_conf_add_single_table(const char* schema,
+                                     const char* table, const char* group);
 
 #endif /* __SHARDING_CONFIG_H__ */

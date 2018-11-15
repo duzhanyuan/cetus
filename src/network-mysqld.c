@@ -72,11 +72,10 @@
 #include "cetus-monitor.h"
 #include "cetus-variable.h"
 #include "plugin-common.h"
-#ifdef NETWORK_DEBUG_TRACE_STATE_CHANGES
-#include "cetus-query-queue.h"
-#endif
-
 #include "network-compress.h"
+#include "network-ssl.h"
+#include "chassis-sql-log.h"
+#include "cetus-acl.h"
 
 #ifdef HAVE_WRITEV
 #define USE_BUFFERED_NETIO
@@ -85,7 +84,6 @@
 #endif
 
 #define XA_BUF_LEN 2048
-#define XA_CMD_BUF_LEN 64
 #define E_NET_CONNRESET ECONNRESET
 #define E_NET_CONNABORTED ECONNABORTED
 #define E_NET_INPROGRESS EINPROGRESS
@@ -100,6 +98,8 @@
 #else
 #define E_NET_WOULDBLOCK EWOULDBLOCK
 #endif
+
+extern int      cetus_last_process;
 
 static void network_mysqld_self_con_handle(int event_fd, short events, void *user_data);
 
@@ -176,6 +176,9 @@ network_mysqld_priv_init(void)
     priv->backends = network_backends_new();
     priv->users = cetus_users_new();
     priv->monitor = cetus_monitor_new();
+    priv->acl = cetus_acl_new();
+    priv->thread_id = 1;
+
     return priv;
 }
 
@@ -226,6 +229,7 @@ network_mysqld_priv_free(chassis G_GNUC_UNUSED *chas, chassis_private *priv)
     cetus_users_free(priv->users);
     g_free(priv->stats_variables);
     cetus_monitor_free(priv->monitor);
+    cetus_acl_free(priv->acl);
     g_free(priv);
 }
 
@@ -241,6 +245,17 @@ network_mysqld_init(chassis *srv)
     cetus_monitor_register_object(srv->priv->monitor, "users", cetus_users_reload_callback, srv->priv->users);
     cetus_variables_init_stats(&srv->priv->stats_variables, srv);
 
+#ifdef HAVE_OPENSSL
+    if (srv->ssl) {
+        gboolean ok = network_ssl_init(srv->conf_dir);
+        if (!ok) {
+            g_critical("SSL init error, not using secure connection");
+            srv->ssl = 0;
+        }
+    } else {
+        g_message("ssl is false");
+    }
+#endif
     return 0;
 }
 
@@ -271,14 +286,14 @@ network_mysqld_con_new()
     con->read_timeout.tv_sec = 10 * MINUTES;
     con->read_timeout.tv_usec = 0;
 
+    con->dist_tran_decided_read_timeout.tv_sec = 30;
+    con->dist_tran_decided_read_timeout.tv_usec = 0;
+
     con->write_timeout.tv_sec = 10 * MINUTES;
     con->write_timeout.tv_usec = 0;
 
     con->wait_clt_next_sql.tv_sec = 0;
     con->wait_clt_next_sql.tv_usec = 256 * 1000;
-#ifdef NETWORK_DEBUG_TRACE_STATE_CHANGES
-    con->recent_queries = query_queue_new(20);
-#endif
     return con;
 }
 
@@ -291,6 +306,31 @@ network_mysqld_add_connection(chassis *srv, network_mysqld_con *con, gboolean li
     if (listen) {
         srv->priv->listen_conns = g_list_append(srv->priv->listen_conns, con);
     }
+}
+
+gboolean
+network_mysqld_kill_connection(chassis *srv, guint32 id)
+{
+    int i;
+        
+    for (i = 0; i < srv->priv->cons->len; ++i) {
+        network_mysqld_con* con = g_ptr_array_index(srv->priv->cons, i);
+
+        if (!con->client || !con->client->challenge) {
+            continue;
+        }
+
+        if (con->client->challenge->thread_id == id) {
+            g_ptr_array_remove_index(srv->priv->cons, i);
+            con->server_to_be_closed = 1;
+            plugin_call_cleanup(srv, con);
+            g_message(G_STRLOC "kill query %u", (unsigned int) id);
+            network_mysqld_con_free(con);
+            return TRUE;
+        }
+    }
+
+    return FALSE;
 }
 
 static void
@@ -342,7 +382,7 @@ network_mysqld_con_free(network_mysqld_con *con)
     }
 
     if (con->server)
-        network_socket_free(con->server);
+        network_socket_send_quit_and_free(con->server);
     if (con->client)
         network_socket_free(con->client);
 
@@ -373,9 +413,6 @@ network_mysqld_con_free(network_mysqld_con *con)
     con->srv->priv->listen_conns = g_list_remove(con->srv->priv->listen_conns, con);
     con->srv->allow_new_conns = TRUE;
 
-#ifdef NETWORK_DEBUG_TRACE_STATE_CHANGES
-    query_queue_free(con->recent_queries);
-#endif
     g_free(con);
 }
 
@@ -394,6 +431,20 @@ network_mysqld_con_retry_timeout(network_mysqld_con *con)
         timeout.tv_usec += cnt * 10000;
     }
     return timeout;
+}
+
+void network_mysqld_con_clear_xa_env_when_not_expected(network_mysqld_con *con)
+{
+    con->dist_tran = 0;
+    con->dist_tran_failed = 0;
+    if (con->is_start_tran_command) {
+        con->is_auto_commit = 1;
+        con->is_start_tran_command = 0;
+    }
+    con->is_in_transaction = 0;
+    con->client->is_need_q_peek_exec = 0;
+    con->client->is_server_conn_reserved = 0;
+    con->server_to_be_closed = 1;
 }
 
 int
@@ -648,6 +699,8 @@ network_mysqld_con_get_packet(chassis *chas, network_socket *con)
     if (con->do_compress) {
         g_debug("%s:queue from recv_queue_uncompress_raw:%p", G_STRLOC, con);
         recv_queue_raw = con->recv_queue_uncompress_raw;
+    } else if (con->ssl) {
+        recv_queue_raw = con->recv_queue_decrypted_raw;
     } else {
         recv_queue_raw = con->recv_queue_raw;
     }
@@ -703,6 +756,92 @@ network_mysqld_con_get_packet(chassis *chas, network_socket *con)
     return NETWORK_SOCKET_SUCCESS;
 }
 
+static GString* network_mysqld_get_compressed_packet(network_socket* sock)
+{
+    network_queue* queue = sock->send_queue;
+    if (g_queue_get_length(queue->chunks) == 0)
+        return NULL;
+    GString *compressed_packet = g_string_sized_new(16384);
+    network_mysqld_proto_append_packet_len(compressed_packet, 0);
+    network_mysqld_proto_append_packet_id(compressed_packet, sock->compressed_packet_id);
+    sock->compressed_packet_id++;
+    network_mysqld_proto_append_packet_len(compressed_packet, 0);
+
+    z_stream strm;
+    cetus_compress_init(&strm);
+
+    int uncompressed_len = 0;
+    int flush = 0;
+
+    int chunk_id = 0;
+    GList* chunk;
+    for (chunk = queue->chunks->head, chunk_id = 0;
+         chunk; chunk_id++, chunk = chunk->next) {
+        GString *s = chunk->data;
+        char *buf;
+        int buf_len;
+        if (chunk_id == 0) {
+            buf = s->str + queue->offset;
+            buf_len = s->len - queue->offset;
+        } else {
+            buf = s->str;
+            buf_len = s->len;
+        }
+
+        uncompressed_len += buf_len;
+        if (uncompressed_len > PACKET_LEN_MAX) {
+            flush = 1;
+            uncompressed_len -= buf_len;
+            buf_len = PACKET_LEN_MAX - uncompressed_len;
+            if (buf_len == 0) {
+                buf = NULL;
+            }
+            uncompressed_len = PACKET_LEN_MAX;
+            cetus_compress(&strm, compressed_packet, buf, buf_len, 1);
+            cetus_compress_end(&strm);
+        } else {
+            flush = (chunk == queue->chunks->tail) ? 1 : 0;
+            cetus_compress(&strm, compressed_packet, buf, buf_len, flush);
+            if (flush) {
+                cetus_compress_end(&strm);
+            }
+        }
+        queue->offset += buf_len;
+        sock->total_output += buf_len;
+        if (flush == 1) {
+            break;
+        }
+    }
+    /* delete used chunks, adjust offset */
+    for (chunk = queue->chunks->head; chunk; ) {
+        GString *s = chunk->data;
+
+        if (queue->offset >= s->len) {
+            queue->offset -= s->len;
+            g_string_free(s, TRUE);
+            g_queue_delete_link(queue->chunks, chunk);
+
+            chunk = queue->chunks->head;
+        } else {
+            break; /* have some residual */
+        }
+    }
+
+    int compressed_len = compressed_packet->len - NET_HEADER_SIZE - COMP_HEADER_SIZE;
+    network_mysqld_proto_set_compressed_packet_len(compressed_packet,
+                                                   compressed_len, uncompressed_len);
+    return compressed_packet;
+}
+
+static int network_mysqld_con_compress_all_packets(network_socket* sock)
+{
+    GString* packet = NULL;
+    while (packet = network_mysqld_get_compressed_packet(sock)) {
+        network_queue_append(sock->send_queue_compressed, packet);
+    }
+    return 1;
+}
+
 network_socket_retval_t
 network_mysqld_con_get_uncompressed_packet(chassis *chas, network_socket *con)
 {
@@ -719,9 +858,14 @@ network_mysqld_con_get_uncompressed_packet(chassis *chas, network_socket *con)
     header.str = header_str;
     header.allocated_len = sizeof(header_str);
     header.len = 0;
-
+    network_queue *src_queue = con->recv_queue_raw;
+#ifdef HAVE_OPENSSL
+    if (con->ssl) {
+        src_queue = con->recv_queue_decrypted_raw;
+    }
+#endif
     /* read the packet len if the leading packet */
-    if (!network_queue_peek_str(con->recv_queue_raw, header_length, &header)) {
+    if (!network_queue_peek_str(src_queue, header_length, &header)) {
         /* too small */
         return NETWORK_SOCKET_WAIT_FOR_EVENT;
     }
@@ -733,7 +877,7 @@ network_mysqld_con_get_uncompressed_packet(chassis *chas, network_socket *con)
     }
 
     /* move the packet from the raw queue to the recv-queue */
-    if ((packet = network_queue_pop_str(con->recv_queue_raw, packet_len + NET_HEADER_SIZE + COMP_HEADER_SIZE, NULL))) {
+    if ((packet = network_queue_pop_str(src_queue, packet_len + NET_HEADER_SIZE + COMP_HEADER_SIZE, NULL))) {
 #if NETWORK_DEBUG_TRACE_IO
         g_debug("%s:output for sock:%p", G_STRLOC, con);
         /* to trace the data we received from the socket, enable this */
@@ -905,7 +1049,7 @@ network_mysqld_read_mul_packets(chassis G_GNUC_UNUSED *chas,
                 }
 
                 if (query->warning_count > 0) {
-                    g_message("%s warning flag from server:%s is met:%s",
+                    g_debug("%s warning flag from server:%s is met:%s",
                               G_STRLOC, server->dst->name->str, con->orig_sql->str);
                     con->last_warning_met = 1;
                 }
@@ -968,7 +1112,13 @@ network_mysqld_read(chassis G_GNUC_UNUSED *chas, network_socket *sock)
         g_error("NETWORK_SOCKET_ERROR_RETRY wasn't expected");
         break;
     }
-
+#ifdef HAVE_OPENSSL
+    if (sock->ssl) {
+        if (!network_ssl_decrypt_packet(sock)) {
+            return NETWORK_SOCKET_ERROR;
+        }
+    }
+#endif
     if (sock->do_compress) {
         int ret = network_mysqld_con_get_uncompressed_packet(chas, sock);
         if (ret != NETWORK_SOCKET_SUCCESS) {
@@ -982,11 +1132,18 @@ network_mysqld_read(chassis G_GNUC_UNUSED *chas, network_socket *sock)
 }
 
 network_socket_retval_t
-network_mysqld_write(chassis G_GNUC_UNUSED *chas, network_socket *sock)
+network_mysqld_write(network_socket *sock)
 {
+    if (sock->do_compress) {
+        network_mysqld_con_compress_all_packets(sock);
+    }
     network_socket_retval_t ret;
-
-    ret = network_socket_write(sock, -1);
+#ifdef HAVE_OPENSSL
+    if (sock->ssl)
+        ret = network_ssl_write(sock, -1);
+    else
+#endif
+        ret = network_socket_write(sock, -1);
 
     return ret;
 }
@@ -1049,24 +1206,24 @@ plugin_call(chassis *srv, network_mysqld_con *con, int state)
              */
             switch (con->auth_result_state) {
             case MYSQLD_PACKET_OK:
-                if (con->login_failed) {
-                    g_message("%s: clt login failed:%p", G_STRLOC, con);
-                } else {
-                    /* 
-                     * OK, delivered to client, 
-                     * switch to command phase
-                     */
-                    con->state = ST_READ_QUERY;
-                    if (con->is_client_compressed) {
-                        con->client->do_compress = 1;
-                        network_socket_set_send_buffer_size(con->client, COMPRESS_BUF_SIZE);
-                    }
+                /*
+                 * OK, delivered to client,
+                 * switch to command phase
+                 */
+                con->state = ST_READ_QUERY;
+                if (con->is_client_compressed) {
+                    con->client->do_compress = 1;
+                    network_socket_set_send_buffer_size(con->client, COMPRESS_BUF_SIZE);
                 }
                 break;
             case MYSQLD_PACKET_ERR:
                 /* ERR delivered to client, close the conn now */
                 con->prev_state = con->state;
                 con->state = ST_ERROR;
+                break;
+            case AUTH_SWITCH:
+                con->auth_result_state = MYSQLD_PACKET_OK;
+                con->state = ST_READ_AUTH;
                 break;
             default:
                 g_debug("%s: unexpected st for SEND_AUTH_RESULT: %02x", G_STRLOC, con->auth_result_state);
@@ -1155,6 +1312,10 @@ network_mysqld_con_reset_query_state(network_mysqld_con *con)
     }
 
     if (con->modified_sql) {
+        if (con->sharding_plan) {
+            con->sharding_plan->modified_sql = NULL;
+            con->sharding_plan->is_modified = 0;
+        }
         g_string_free(con->modified_sql, TRUE);
         con->modified_sql = NULL;
     }
@@ -1215,12 +1376,17 @@ check_query_status(network_mysqld_con *con, network_socket *server, network_mysq
         return;
     }
     if (com_query->server_status & SERVER_STATUS_IN_TRANS) {
-        con->is_in_transaction = 1;
-        server->is_in_tran_context = 1;
+        if (!server->is_read_only) {
+            con->is_in_transaction = 1;
+            server->is_in_tran_context = 1;
+            g_debug("%s: set is_in_transaction true for con:%p", G_STRLOC, con);
+        } else {
+            g_message("%s: SERVER_STATUS_IN_TRANS true from read server", G_STRLOC);
+        }
     } else {
         con->is_in_transaction = 0;
         server->is_in_tran_context = 0;
-        g_debug("%s: set is_in_transaction false", G_STRLOC);
+        g_debug("%s: set is_in_transaction false:%p", G_STRLOC, con);
     }
 
     if (!con->is_in_transaction) {
@@ -1590,11 +1756,17 @@ build_attr_statements(network_mysqld_con *con)
     }
 }
 
-void
+int
 shard_build_xa_query(network_mysqld_con *con, server_session_t *ss)
 {
     network_socket *recv_sock = con->client;
     GList *chunk = recv_sock->recv_queue->chunks->head;
+
+    if (chunk == NULL) {
+        g_critical("%s:chunk is nil", G_STRLOC);
+        return -1;
+    }
+
     GString *packet = (GString *)(chunk->data);
 
     g_debug("%s:packet id:%d when get server", G_STRLOC, ss->server->last_packet_id);
@@ -1616,6 +1788,8 @@ shard_build_xa_query(network_mysqld_con *con, server_session_t *ss)
     con->is_xa_query_sent = 1;
     con->all_participate_num++;
     con->resp_expected_num++;
+
+    return 0;
 }
 
 static void
@@ -1677,8 +1851,6 @@ build_xa_command(network_mysqld_con *con, server_session_t *ss, int end, char *b
                 con->is_auto_commit = 1;
                 con->is_start_tran_command = 0;
                 con->is_in_transaction = 0;
-                con->client->is_need_q_peek_exec = 1;
-                con->client->is_server_conn_reserved = 0;
                 g_debug("%s: set is_need_q_peek_exec true", G_STRLOC);
             } else {
                 g_debug("%s: is_start_tran_command false", G_STRLOC);
@@ -1742,8 +1914,8 @@ disp_xa_abnormal_resultset(network_mysqld_con *con, server_session_t *ss,
 
     } else if (con->dist_tran_state <= NEXT_ST_XA_ROLLBACK) {
         if (ss->dist_tran_state < con->dist_tran_state) {
-            ss->dist_tran_state = con->dist_tran_state;
             g_message("%s:adjust ss dist state:%d to %d", G_STRLOC, ss->dist_tran_state, con->dist_tran_state);
+            ss->dist_tran_state = con->dist_tran_state;
         }
 
         if (*is_xa_cmd_met) {
@@ -1765,7 +1937,7 @@ disp_xa_abnormal_resultset(network_mysqld_con *con, server_session_t *ss,
     }
 }
 
-static void
+static int
 disp_xa_according_state(network_mysqld_con *con, server_session_t *ss,
                         int *is_xa_cmd_met, int *is_xa_query, char **p_buffer, char *buffer, int end)
 {
@@ -1781,7 +1953,10 @@ disp_xa_according_state(network_mysqld_con *con, server_session_t *ss,
         snprintf(*p_buffer, XA_BUF_LEN - (*p_buffer - buffer), "%s@%d",
                  ss->server->dst->name->str, ss->server->challenge->thread_id);
         *p_buffer = *p_buffer + strlen(*p_buffer);
-        shard_build_xa_query(con, ss);
+        if (shard_build_xa_query(con, ss) == -1) {
+            g_warning("%s:shard_build_xa_query failed for con:%p", G_STRLOC, con);
+            return -1;
+        }
         *is_xa_query = 1;
         g_debug("%s:set is xa query true for con:%p", G_STRLOC, con);
         if (con->is_auto_commit) {
@@ -1811,6 +1986,8 @@ disp_xa_according_state(network_mysqld_con *con, server_session_t *ss,
             break;
         }
     }
+    
+    return 0;
 }
 
 static void
@@ -1890,7 +2067,13 @@ build_xa_statements(network_mysqld_con *con)
         if (result == -1) {
             disp_xa_abnormal_resultset(con, ss, &is_xa_cmd_met, &p_buffer, buffer, end);
         } else {
-            disp_xa_according_state(con, ss, &is_xa_cmd_met, &is_xa_query, &p_buffer, buffer, end);
+            if (disp_xa_according_state(con, ss, &is_xa_cmd_met,
+                        &is_xa_query, &p_buffer, buffer, end) == -1)
+            {
+                con->server_to_be_closed = 1;
+                con->dist_tran_state = NEXT_ST_XA_OVER;
+                return;
+            }
         }
 
         global_xa_state = ss->dist_tran_state;
@@ -2027,12 +2210,6 @@ normal_result_merge(network_mysqld_con *con)
             network_mysqld_con_send_error_full(con->client, C("merge failed"), ER_CETUS_RESULT_MERGE, "HY000");
         }
         break;
-    case RM_CALL_FAIL:{
-        char msg[128] = { 0 };
-        snprintf(msg, sizeof(msg), "id:%lu '%s' failed", uniq_id, con->orig_sql->str);
-        network_mysqld_con_send_error_full(con->client, msg, strlen(msg), ER_CETUS_RESULT_MERGE, "HY000");
-        break;
-    }
     default:
         break;
     }
@@ -2115,6 +2292,23 @@ disp_query_after_consistant_attr(network_mysqld_con *con)
     }
 }
 
+void log_slowquery(int interval_ms, char* host, char* user, char* sql)
+{
+    uint64_t usec;
+    struct timeval t;
+    gettimeofday(&t, NULL);
+    usec = (uint64_t)t.tv_sec * 1000000 + t.tv_usec;
+    char time_str[64];
+    make_iso8601_timestamp(time_str, usec);
+
+    float interval = interval_ms / 1000.0;
+    g_log("slowquery", G_LOG_LEVEL_MESSAGE,
+          "# Time: %s\n"
+          "# User@Host: %s @ %s Id: 0\n"
+          "# Query_time: %f Lock_time: 0.000000 Rows_sent: 0 Rows_examined: 0\n"
+          "SET timestamp=%ld;\n%s;", time_str, user, host, interval, t.tv_sec, sql);
+}
+
 static void
 handle_query_time_stats(network_mysqld_con *con)
 {
@@ -2123,9 +2317,8 @@ handle_query_time_stats(network_mysqld_con *con)
 
     diff = MAX(0, diff);
     if (diff >= con->srv->long_query_time) {
-        g_log("slowquery", G_LOG_LEVEL_MESSAGE,
-              "time: %dms, client: %s, user: %s, sql: %s",
-              diff, con->client->src->name->str, con->client->response->username->str, con->orig_sql->str);
+        log_slowquery(diff, con->client->src->name->str,
+                      con->client->response->username->str, con->orig_sql->str);
         diff = con->srv->long_query_time - 1;
     }
     con->srv->query_stats.query_time_table[diff]++;
@@ -2146,6 +2339,51 @@ handle_query_wait_stats(network_mysqld_con *con)
     }
 
     con->srv->query_stats.query_wait_table[diff]++;
+}
+
+static void
+process_service_unavailable(network_mysqld_con *con)
+{
+    con->state = ST_SEND_QUERY_RESULT;
+    g_message("%s: service unavailable for con:%p", G_STRLOC, con);
+
+#ifndef SIMPLE_PARSER
+    if (con->servers != NULL) {
+        g_debug("%s: server num :%d for con:%p", G_STRLOC, (int)con->servers->len, con);
+        size_t i;
+        for (i = 0; i < con->servers->len; i++) {
+            server_session_t *ss = g_ptr_array_index(con->servers, i);
+            if (ss->fresh) {
+                CHECK_PENDING_EVENT(&(ss->server->event));
+                network_pool_add_idle_conn(ss->backend->pool, con->srv, ss->server);
+                ss->backend->connected_clients--;
+                g_message("%s: connected_clients sub:%d, %d ndx for con:%p", G_STRLOC,
+                          ss->backend->connected_clients, (int)i, con);
+                g_ptr_array_remove(con->servers, ss);
+                ss->server = NULL;
+                server_session_free(ss);
+                i--;
+            }
+        }
+    }
+#endif
+
+    if (con->dist_tran) {
+        if (con->orig_sql) {
+            g_message("%s: global update/insert is not fullfiled for con:%p, sql:%s", 
+                    G_STRLOC, con, con->orig_sql->str);
+        } else {
+            g_message("%s: global update/insert is not fullfiled for con:%p", 
+                    G_STRLOC, con);
+        }
+        network_mysqld_con_clear_xa_env_when_not_expected(con);
+    }
+
+    network_mysqld_con_send_error_full(con->client, C("service unavailable"), ER_TOO_MANY_USER_CONNECTIONS, "42000");
+    con->server_to_be_closed = 1;
+    con->is_wait_server = 0;
+    network_queue_clear(con->client->recv_queue);
+    network_mysqld_queue_reset(con->client);
 }
 
 static int
@@ -2191,11 +2429,19 @@ handle_read_query(network_mysqld_con *con, network_mysqld_con_state_t ostate)
                     con->client->is_need_q_peek_exec = 0;
                     g_debug("%s: set a short timeout:%p", G_STRLOC, con);
                 } else {
-                    timeout = con->read_timeout;
-                    g_debug("%s: set a long timeout:%p", G_STRLOC, con);
+                    if (con->srv->maintain_close_mode && con->is_admin_client == 0) {
+                        timeout.tv_sec = con->srv->maintained_client_idle_timeout;
+                        timeout.tv_usec = 0;
+                        g_debug("%s: set a maintained client timeout:%p", G_STRLOC, con);
+                    } else {
+                        timeout.tv_sec = con->srv->client_idle_timeout;
+                        timeout.tv_usec = 0;
+                        g_debug("%s: set a long timeout:%p", G_STRLOC, con);
+                    }
                 }
 
                 WAIT_FOR_EVENT(con->client, EV_READ, &timeout);
+
                 return DISP_STOP;
             case NETWORK_SOCKET_ERROR_RETRY:
             case NETWORK_SOCKET_ERROR:
@@ -2217,8 +2463,17 @@ handle_read_query(network_mysqld_con *con, network_mysqld_con_state_t ostate)
     }
 
     con->resp_too_long = 0;
+
+    /* check for tracing some problems and it will be removed later */
+    if (con->client->recv_queue->chunks->head == NULL) {
+        g_critical("%s:client recv queue head is nil", G_STRLOC);
+    }
+
     g_debug("%s:call read query", G_STRLOC);
-    switch (plugin_call(srv, con, con->state)) {
+    network_socket_retval_t ret = plugin_call(srv, con, con->state);
+    switch (ret) {
+    case NETWORK_SOCKET_WAIT_FOR_EVENT:
+        return DISP_STOP;
     case NETWORK_SOCKET_SUCCESS:
         if (con->retry_serv_cnt > 0 && con->is_wait_server) {
             g_message("%s: wait successful:%d, con:%p", G_STRLOC, con->retry_serv_cnt, con);
@@ -2229,7 +2484,7 @@ handle_read_query(network_mysqld_con *con, network_mysqld_con_state_t ostate)
         break;
     case NETWORK_SOCKET_ERROR_RETRY:
         if (con->retry_serv_cnt < con->max_retry_serv_cnt) {
-            if (con->retry_serv_cnt == 0 || con->retry_serv_cnt == 8) {
+            if (con->retry_serv_cnt % 8 == 0) {
                 network_connection_pool_create_conn(con);
             }
             con->retry_serv_cnt++;
@@ -2242,14 +2497,11 @@ handle_read_query(network_mysqld_con *con, network_mysqld_con_state_t ostate)
         }
         /* fall through */
     default:
-        g_critical("%s: wait failed and no server backend for user:%s", G_STRLOC, con->client->response->username->str);
+        g_critical("%s: wait failed and no server backend for user:%s, ret:%d",
+                G_STRLOC, con->client->response->username->str, ret);
 
         handle_query_wait_stats(con);
-        con->state = ST_SEND_ERROR;
-        network_mysqld_con_send_error_full(con->client, C("service unavailable"), ER_SERVER_SHUTDOWN, "08S01");
-        con->is_wait_server = 0;
-        network_queue_clear(con->client->recv_queue);
-        network_mysqld_queue_reset(con->client);
+        process_service_unavailable(con);
         break;
     }
 
@@ -2282,7 +2534,7 @@ process_write_to_server(network_mysqld_con *con, server_session_t *ss, int *writ
     network_socket_retval_t ret;
 
     con->num_write_pending++;
-    ret = network_mysqld_write(con->srv, ss->server);
+    ret = network_mysqld_write(ss->server);
 
     switch (ret) {
     case NETWORK_SOCKET_SUCCESS:
@@ -2309,6 +2561,8 @@ process_write_to_server(network_mysqld_con *con, server_session_t *ss, int *writ
         char *msg = "write error";
         con->state = ST_SEND_QUERY_RESULT;
         con->server_to_be_closed = 1;
+        con->dist_tran = 0;
+        con->is_client_to_be_closed = 1;
         g_warning("%s:write error for con:%p, ret:%d", G_STRLOC, con, ret);
         network_mysqld_con_send_error_full(con->client, L(msg), ER_NET_ERROR_ON_WRITE, "08S01");
         break;
@@ -2402,7 +2656,7 @@ process_rw_write(network_mysqld_con *con, network_mysqld_con_state_t ostate, int
     con->server->resp_len = 0;
     con->server->compressed_packet_id = 0;
 
-    switch (network_mysqld_write(con->srv, con->server)) {
+    switch (network_mysqld_write(con->server)) {
     case NETWORK_SOCKET_SUCCESS:
         break;
     case NETWORK_SOCKET_WAIT_FOR_EVENT:
@@ -2432,10 +2686,10 @@ process_rw_write(network_mysqld_con *con, network_mysqld_con_state_t ostate, int
     case COM_STMT_SEND_LONG_DATA:  /* not acked */
     case COM_STMT_CLOSE:
         if (!con->server_to_be_closed) {
-            g_message("%s: set ST_READ_QUERY for con:%p", G_STRLOC, con);
+            g_debug("%s: set ST_READ_QUERY for con:%p", G_STRLOC, con);
             con->state = ST_READ_QUERY;
         } else {
-            g_message("%s: set ST_CLOSE_SERVER for con:%p", G_STRLOC, con);
+            g_debug("%s: set ST_CLOSE_SERVER for con:%p", G_STRLOC, con);
             con->state = ST_CLOSE_SERVER;
         }
         if (con->client) {
@@ -2498,7 +2752,15 @@ shard_read_response(network_mysqld_con *con, server_session_t *ss)
             if (ss->server->to_read == 0) {
                 ss->state = NET_RW_STATE_READ;
                 g_debug("%s:read wait here for con:%p", G_STRLOC, con);
-                server_sess_wait_for_event(ss, EV_READ, &con->read_timeout);
+                if (con->dist_tran_decided) {
+                    server_sess_wait_for_event(ss, EV_READ,
+                            &con->dist_tran_decided_read_timeout);
+                    g_debug("%s:use dist_tran_decided_read_timeout for con:%p",
+                            G_STRLOC, con);
+                } else {
+                    server_sess_wait_for_event(ss, EV_READ, &con->read_timeout);
+                }
+
                 return DISP_CONTINUE;
             }
             break;
@@ -2516,7 +2778,6 @@ shard_read_response(network_mysqld_con *con, server_session_t *ss)
             }
         }
     }
-
     int is_finished = 0;
     switch (network_mysqld_read_mul_packets(con->srv, con, ss->server, &is_finished)) {
     case NETWORK_SOCKET_SUCCESS:
@@ -2531,11 +2792,25 @@ shard_read_response(network_mysqld_con *con, server_session_t *ss)
             ss->state = NET_RW_STATE_FINISHED;
             ss->server->is_read_finished = 1;
             ss->server->is_waiting = 0;
+            if (con->srv->sql_mgr && con->srv->sql_mgr->sql_log_switch == ON) {
+                ss->ts_read_query_result_last = get_timer_microseconds();
+                network_mysqld_com_query_result_t *query = con->parse.data;
+                if (query && query->query_status == MYSQLD_PACKET_ERR) {
+                    ss->query_status = MYSQLD_PACKET_ERR;
+                }
+                log_sql_backend_sharding(con, ss);
+            }
             break;
         } else {
             ss->state = NET_RW_STATE_READ;
             g_debug("%s:server_sess_wait_for_event for con:%p", G_STRLOC, con);
-            server_sess_wait_for_event(ss, EV_READ, &con->read_timeout);
+            if (con->dist_tran_decided) {
+                server_sess_wait_for_event(ss, EV_READ,
+                        &con->dist_tran_decided_read_timeout);
+                g_message("%s:use dist_tran_decided_read_timeout for con:%p", G_STRLOC, con);
+            } else {
+                server_sess_wait_for_event(ss, EV_READ, &con->read_timeout);
+            }
             con->num_read_pending++;
             ss->read_cal_flag = 0;
             g_debug("%s:num_read_pending:%d, ss->index:%d for con:%p",
@@ -2572,12 +2847,17 @@ shard_read_response(network_mysqld_con *con, server_session_t *ss)
             ss->state = NET_RW_STATE_READ;
             g_debug("%s:num_read_pending:%d for fd:%d, ss->index:%d",
                     G_STRLOC, con->num_read_pending, ss->server->fd, ss->index);
-            server_sess_wait_for_event(ss, EV_READ, &con->read_timeout);
+            if (con->dist_tran_decided) {
+                server_sess_wait_for_event(ss, EV_READ, &con->dist_tran_decided_read_timeout);
+                g_message("%s:use dist_tran_decided_read_timeout for con:%p", G_STRLOC, con);
+            } else {
+                server_sess_wait_for_event(ss, EV_READ, &con->read_timeout);
+            }
         }
         break;
     case NETWORK_SOCKET_ERROR:
     default:
-        g_critical("%s:network_mysqld_read_mul_packets error", G_STRLOC);
+        g_critical("%s:network_mysqld_read_mul_packets error for con:%p", G_STRLOC, con);
         con->num_read_pending--;
         con->state = ST_ERROR;
         return DISP_CONTINUE;
@@ -2647,6 +2927,7 @@ handle_dist_tran_after_read_mul_resp(network_mysqld_con *con, int *result_reserv
 
                 con->dist_tran = 0;
                 con->dist_tran_failed = 0;
+                con->client->is_server_conn_reserved = 0;
                 g_debug("%s: set dist tran 0:%p", G_STRLOC, con);
             } else {
                 g_debug("%s: call here for con:%p, xa state:%d", G_STRLOC, con, con->dist_tran_state);
@@ -2666,7 +2947,6 @@ static int
 read_server_resp(network_mysqld_con *con, int *disp_flag)
 {
     int i;
-
     for (i = 0; i < con->servers->len; i++) {
         server_session_t *ss = g_ptr_array_index(con->servers, i);
 
@@ -2745,12 +3025,14 @@ check_server_status(network_mysqld_con *con, int *srv_down_count, int *srv_respo
         server_session_t *ss = g_ptr_array_index(con->servers, i);
 
         if (!ss->participated) {
-            g_debug("%s: server not participated", G_STRLOC);
+            g_debug("%s: server:%d is not participated for con:%p",
+                    G_STRLOC, i, con);
             continue;
         }
 
         network_socket *server = ss->server;
         if (server->unavailable) {
+            g_debug("%s: server:%d is unavailable for con:%p", G_STRLOC, i, con);
             (*srv_down_count)++;
             continue;
         }
@@ -2768,7 +3050,7 @@ check_server_status(network_mysqld_con *con, int *srv_down_count, int *srv_respo
             if (ss->state == NET_RW_STATE_ERROR) {
                 while (con->servers->len > 0) {
                     ss = g_ptr_array_remove_index_fast(con->servers, 0);
-                    network_socket_free(ss->server);
+                    network_socket_send_quit_and_free(ss->server);
                     ss->sql = NULL;
                     ss->server = NULL;
                     server_session_free(ss);
@@ -2799,18 +3081,12 @@ static void
 disp_no_workers(network_mysqld_con *con)
 {
     if (con->dist_tran) {
-        network_queue_clear(con->client->send_queue);
         con->dist_tran_state = NEXT_ST_XA_OVER;
-        con->dist_tran = 0;
         con->dist_tran_failed = 0;
     }
 
-    con->server_to_be_closed = 1;
-    con->state = ST_SEND_QUERY_RESULT;
-    g_message("%s: send dist trans error to client, dist state:%d", G_STRLOC, con->dist_tran_state);
-    network_mysqld_con_send_error_full(con->client, C("service unavailable"), ER_SERVER_SHUTDOWN, "08S01");
-    network_queue_clear(con->client->recv_queue);
-    network_mysqld_queue_reset(con->client);
+    network_queue_clear(con->client->send_queue);
+    process_service_unavailable(con);
 }
 
 static int
@@ -2832,9 +3108,13 @@ disp_resp_workers_not_matched(network_mysqld_con *con, int *disp_flag)
                 if (con->is_attr_adjust) {
                     g_critical("%s: attr adj met problems here for con:%p", G_STRLOC, con);
                     con->server_to_be_closed = 1;
+                } else if (con->is_timeout) {
+                    g_critical("%s: server timeout for con:%p", G_STRLOC, con);
+                    con->server_to_be_closed = 1;
                 } else {
                     if (con->dist_tran_state < NEXT_ST_XA_CANDIDATE_OVER) {
-                        g_debug("%s: build xa stmt for failure, state:%d", G_STRLOC, con->state);
+                        g_debug("%s: build xa stmt for failure, dist state:%d",
+                                G_STRLOC, con->dist_tran_state);
                         build_xa_statements(con);
                         if (con->dist_tran_state != NEXT_ST_XA_OVER) {
                             *disp_flag = DISP_CONTINUE;
@@ -2843,24 +3123,17 @@ disp_resp_workers_not_matched(network_mysqld_con *con, int *disp_flag)
                     }
                 }
 
-                con->state = ST_SEND_QUERY_RESULT;
-                g_message("%s: send dist trans error to client, dist state:%d", G_STRLOC, con->dist_tran_state);
+                g_message("%s: dist state:%d", G_STRLOC, con->dist_tran_state);
                 if (con->dist_tran_state != NEXT_ST_XA_OVER) {
                     g_message("%s: dist state not NEXT_ST_XA_OVER for con:%p", G_STRLOC, con);
                 }
                 g_debug("%s: set dist_tran_state NEXT_ST_XA_OVER for con:%p", G_STRLOC, con);
 
                 con->dist_tran_state = NEXT_ST_XA_OVER;
-                con->dist_tran = 0;
-                con->dist_tran_failed = 0;
 
-                network_mysqld_con_send_error_full(con->client, C("service unavailable"), ER_SERVER_SHUTDOWN, "08S01");
-
+                process_service_unavailable(con);
                 remove_mul_server_recv_packets(con);
-                network_queue_clear(con->client->send_queue);
-                network_queue_clear(con->client->recv_queue);
-                network_mysqld_queue_reset(con->client);
-
+                con->dist_tran_failed = 0;
                 *disp_flag = DISP_CONTINUE;
                 result = 0;
             }
@@ -2993,10 +3266,9 @@ disp_attr(network_mysqld_con *con, int srv_down_count, int *disp_flag)
                     con->dist_tran_state = NEXT_ST_XA_OVER;
                 }
 
-                network_mysqld_con_send_error_full(con->client, C("MySQL server down"), ER_SERVER_SHUTDOWN, "08S01");
-
-                remove_mul_server_recv_packets(con);
                 network_queue_clear(con->client->send_queue);
+                network_mysqld_con_send_error_full(con->client, C("MySQL server down"), ER_SERVER_SHUTDOWN, "08S01");
+                remove_mul_server_recv_packets(con);
                 network_queue_clear(con->client->recv_queue);
                 network_mysqld_queue_reset(con->client);
 
@@ -3076,7 +3348,8 @@ disp_after_resp(network_mysqld_con *con, int srv_down_count, int srv_response_co
 static int
 handle_read_mul_servers_resp(network_mysqld_con *con)
 {
-    g_debug("%s: visit handle_read_mul_servers_resp for con:%p", G_STRLOC, con);
+    g_debug("%s: visit handle_read_mul_servers_resp for con:%p, num pending:%d",
+            G_STRLOC, con, con->num_read_pending);
     int disp_flag = 0;
 
     int srv_down_count = 0, srv_response_count = 0;
@@ -3132,7 +3405,7 @@ send_part_content_to_client(network_mysqld_con *con)
 {
     g_debug("%s: call send_part_content_to_client, and queue len:%llu, con client:%p",
             G_STRLOC, (unsigned long long)con->client->send_queue->chunks->length, con->client);
-    switch (network_mysqld_write(con->srv, con->client)) {
+    switch (network_mysqld_write(con->client)) {
     case NETWORK_SOCKET_SUCCESS:
         break;
     case NETWORK_SOCKET_WAIT_FOR_EVENT:
@@ -3151,39 +3424,25 @@ send_part_content_to_client(network_mysqld_con *con)
 }
 
 static void
-process_service_unavailable(network_mysqld_con *con)
+process_single_tran_confliction(network_mysqld_con *con)
 {
 
     con->state = ST_SEND_QUERY_RESULT;
-    g_message("%s: service unavailable for con:%p", G_STRLOC, con);
+    g_message("%s: single tran but visit multiple servers for con:%p", G_STRLOC, con);
 
     if (con->servers != NULL) {
-        g_debug("%s: server num :%d for con:%p", G_STRLOC, (int)con->servers->len, con);
-        size_t i;
-        for (i = 0; i < con->servers->len; i++) {
-            server_session_t *ss = g_ptr_array_index(con->servers, i);
-            if (ss->fresh) {
-                network_pool_add_idle_conn(ss->backend->pool, con->srv, ss->server);
-                ss->backend->connected_clients--;
-                g_message("%s: connected_clients sub:%d, %d ndx for con:%p", G_STRLOC,
-                          ss->backend->connected_clients, (int)i, con);
-                g_ptr_array_remove(con->servers, ss);
-                ss->server = NULL;
-                server_session_free(ss);
-                i--;
-            }
-        }
-
-        if (con->servers->len == 0) {
-            con->server_to_be_closed = 1;
-        }
+        g_message("%s: server num :%d for con:%p", G_STRLOC, (int)con->servers->len, con);
+        con->server_to_be_closed = 1;
     }
 
-    network_mysqld_con_send_error_full(con->client, C("service unavailable"), ER_TOO_MANY_USER_CONNECTIONS, "42000");
+    network_mysqld_con_send_error_full(con->client, 
+            C("not distributed tran but visit multiple servers"), ER_CETUS_NOT_SUPPORTED, "HY000");
     con->is_wait_server = 0;
     network_queue_clear(con->client->recv_queue);
     network_mysqld_queue_reset(con->client);
+    con->is_client_to_be_closed = 1;
 }
+
 
 static int
 send_result_to_client(network_mysqld_con *con, network_mysqld_con_state_t ostate)
@@ -3205,7 +3464,7 @@ send_result_to_client(network_mysqld_con *con, network_mysqld_con_state_t ostate
     /**
      * send the query result-set to the client 
      */
-    switch (network_mysqld_write(srv, con->client)) {
+    switch (network_mysqld_write(con->client)) {
     case NETWORK_SOCKET_SUCCESS:
         break;
     case NETWORK_SOCKET_WAIT_FOR_EVENT:
@@ -3297,7 +3556,7 @@ send_result_to_client(network_mysqld_con *con, network_mysqld_con_state_t ostate
     }
 
     if (con->resultset_is_finished) {
-        con->client->last_visit_time = time(0);
+        con->client->update_time = srv->current_time;
         if (!con->client->is_server_conn_reserved) {
             con->client->is_need_q_peek_exec = 1;
             g_debug("%s: set is_need_q_peek_exec true, state:%d", G_STRLOC, con->state);
@@ -3308,11 +3567,10 @@ send_result_to_client(network_mysqld_con *con, network_mysqld_con_state_t ostate
     }
 
     if (con->slave_conn_shortaged) {
-        time_t cur = time(0);
-        if (con->last_check_conn_supplement_time != cur) {
+        if (con->last_check_conn_supplement_time != srv->current_time) {
             g_debug("%s: slave conn shortaged, try to add more conns ", G_STRLOC);
             network_connection_pool_create_conn(con);
-            con->last_check_conn_supplement_time = cur;
+            con->last_check_conn_supplement_time = srv->current_time;
         } else {
             g_debug("%s: slave conn shortaged, but time is the same", G_STRLOC);
         }
@@ -3536,6 +3794,7 @@ process_timeout_event(network_mysqld_con *con)
 void
 network_mysqld_con_handle(int event_fd, short events, void *user_data)
 {
+    g_debug("%s:visit network_mysqld_con_handle", G_STRLOC);
     network_mysqld_con_state_t ostate;
     network_mysqld_con *con = user_data;
     chassis *srv = con->srv;
@@ -3560,7 +3819,7 @@ network_mysqld_con_handle(int event_fd, short events, void *user_data)
          * if you need the state-change information without dtrace,
          * enable this
          */
-        g_debug("%s: [%d] %s, con:%p", G_STRLOC, getpid(), network_mysqld_con_st_name(con->state), con);
+        g_debug("%s: %s, con:%p", G_STRLOC, network_mysqld_con_st_name(con->state), con);
 #endif
         switch (con->state) {
         case ST_ERROR:
@@ -3636,7 +3895,7 @@ network_mysqld_con_handle(int event_fd, short events, void *user_data)
             /* send the hand-shake to the client and 
              * wait for a response
              */
-            switch (network_mysqld_write(srv, con->client)) {
+            switch (network_mysqld_write(con->client)) {
             case NETWORK_SOCKET_SUCCESS:
                 break;
             case NETWORK_SOCKET_WAIT_FOR_EVENT:
@@ -3708,16 +3967,51 @@ network_mysqld_con_handle(int event_fd, short events, void *user_data)
                 con->state = ST_ERROR;
                 break;
             }
-
             break;
         }
+#ifdef HAVE_OPENSSL
+        case ST_FRONT_SSL_HANDSHAKE:
+            g_debug(G_STRLOC " %p con_handle -> ST_FRONT_SSL_HANDSHAKE", con);
+            if (events & EV_READ) {
+                switch (network_socket_read(con->client)) {
+                case NETWORK_SOCKET_SUCCESS:
+                    break;
+                case NETWORK_SOCKET_WAIT_FOR_EVENT:
+                    timeout = con->read_timeout;
+                    WAIT_FOR_EVENT(con->client, EV_READ, &timeout);
+                    return;
+                case NETWORK_SOCKET_ERROR_RETRY:
+                case NETWORK_SOCKET_ERROR:
+                    con->state = ST_ERROR;
+                    g_warning("%s: ST_FRONT_SSL_HANDSHAKE: read error con:%p", G_STRLOC, con);
+                    break;
+                }
+            }
+            switch (network_ssl_handshake(con->client)) {
+            case NETWORK_SOCKET_SUCCESS:
+                con->state = ST_READ_AUTH;
+                break;
+            case NETWORK_SOCKET_WAIT_FOR_EVENT:
+                timeout = con->read_timeout;
+                WAIT_FOR_EVENT(con->client, EV_READ, &timeout);
+                g_debug(G_STRLOC " %p WAIT_FOR_EVENT, return", con);
+                return;
+            case NETWORK_SOCKET_WAIT_FOR_WRITABLE:
+                timeout = con->write_timeout;
+                WAIT_FOR_EVENT(con->client, EV_WRITE, &timeout);
+                return;
+            case NETWORK_SOCKET_ERROR:
+                con->state = ST_ERROR;
+                break;
+            }
+            break;
+#endif
         case ST_SEND_AUTH_RESULT:
-            switch (network_mysqld_write(srv, con->client)) {
+            switch (network_mysqld_write(con->client)) {
             case NETWORK_SOCKET_SUCCESS:
                 break;
             case NETWORK_SOCKET_WAIT_FOR_EVENT:
                 timeout = con->write_timeout;
-
                 WAIT_FOR_EVENT(con->client, EV_WRITE, &timeout);
                 return;
             case NETWORK_SOCKET_ERROR_RETRY:
@@ -3756,12 +4050,11 @@ network_mysqld_con_handle(int event_fd, short events, void *user_data)
             case NETWORK_SOCKET_WAIT_FOR_EVENT:
                 if (con->retry_serv_cnt < con->max_retry_serv_cnt) {
                     con->master_conn_shortaged = 1;
-                    con->retry_serv_cnt++;
                     con->is_wait_server = 1;
-                    g_debug("%s:PROXY_NO_CONNECTION", G_STRLOC);
-                    if (con->retry_serv_cnt == 0 || con->retry_serv_cnt == 8) {
+                    if (con->retry_serv_cnt % 8 == 0) {
                         network_connection_pool_create_conn(con);
                     }
+                    con->retry_serv_cnt++;
                     struct timeval timeout = network_mysqld_con_retry_timeout(con);
 
                     g_debug(G_STRLOC ": wait again:%d, con:%p, l:%d", con->retry_serv_cnt, con, (int)timeout.tv_usec);
@@ -3776,13 +4069,21 @@ network_mysqld_con_handle(int event_fd, short events, void *user_data)
                 break;
 
             default:
-                process_service_unavailable(con);
+                if (con->xa_tran_conflict) {
+                    process_single_tran_confliction(con);
+                    con->xa_tran_conflict = 0;
+                } else {
+                    process_service_unavailable(con);
+                }
                 break;
             }
             break;
         case ST_READ_QUERY:
-            g_debug("%s:call here.", G_STRLOC);
-            CHECK_PENDING_EVENT(&(con->client->event));
+            g_debug(G_STRLOC " %p con_handle -> ST_READ_QUERY", con);
+
+            if (events == EV_READ) {
+                CHECK_PENDING_EVENT(&(con->client->event));
+            }
 
             /* TODO If config is reloaded, close all current cons */
             g_assert(events == 0 || event_fd == con->client->fd);
@@ -3817,7 +4118,7 @@ network_mysqld_con_handle(int event_fd, short events, void *user_data)
              * send error to the client
              * and close the connections afterwards
              */
-            switch (network_mysqld_write(srv, con->client)) {
+            switch (network_mysqld_write(con->client)) {
             case NETWORK_SOCKET_SUCCESS:
                 break;
             case NETWORK_SOCKET_WAIT_FOR_EVENT:
@@ -3949,11 +4250,10 @@ network_mysqld_con_accept(int G_GNUC_UNUSED event_fd, short events, void *user_d
     client_con = network_mysqld_con_new();
     client_con->client = client;
 
-    g_debug("%s: add a new client connection: %p", G_STRLOC, client_con);
-
     network_mysqld_add_connection(listen_con->srv, client_con, FALSE);
 
     client_con->key = client_con->srv->sess_key++;
+    g_debug("%s: accept a new client connection", G_STRLOC);
 
     /**
      * inherit the config to the new connection 
@@ -4193,8 +4493,9 @@ proxy_self_read_handshake(chassis *srv, server_connection_state_t *con)
     }
 
     con->server->challenge = challenge;
-    network_backend_save_challenge(con->backend, challenge);
-
+    if (con->backend->server_version->len == 0) {
+        g_string_append(con->backend->server_version, challenge->server_version_str);
+    }
     return RET_SUCCESS;
 }
 
@@ -4218,6 +4519,7 @@ proxy_self_create_auth(chassis *srv, server_connection_state_t *con)
     if (!srv->client_found_rows) {
         auth->client_capabilities &= ~CLIENT_FOUND_ROWS;
     }
+    auth->client_capabilities &= ~CLIENT_PLUGIN_AUTH;
 
     auth->max_packet_size = 0x01000000;
     auth->charset = con->charset_code;
@@ -4226,8 +4528,6 @@ proxy_self_create_auth(chassis *srv, server_connection_state_t *con)
 
     g_string_truncate(auth->auth_plugin_data, 0);
     network_mysqld_proto_password_scramble(auth->auth_plugin_data, S(challenge->auth_plugin_data), S(con->hashed_pwd));
-
-    g_string_assign_len(challenge->scrambled_password, S(auth->auth_plugin_data));
 
     g_string_append_len(auth->database, S(send_sock->default_db));
     g_string_assign_len(auth->username, S(send_sock->username));
@@ -4265,7 +4565,7 @@ network_mysqld_self_con_free(server_connection_state_t *con)
         return;
 
     if (con->server) {
-        network_socket_free(con->server);
+        network_socket_send_quit_and_free(con->server);
         g_debug("%s: connection server free:%p", G_STRLOC, con);
         con->server = NULL;
     } else {
@@ -4284,7 +4584,9 @@ chassis_event_add_with_timeout(srv, &(sock->event), timeout);
 static int
 process_self_event(server_connection_state_t *con, int events, int event_fd)
 {
+    g_debug("%s:events:%d, ev:%p, state:%d", G_STRLOC, events, (&con->server->event), con->state);
     if (events == EV_READ) {
+        g_debug("%s:EV_READ, ev:%p, state:%d", G_STRLOC, (&con->server->event), con->state);
         int b = -1;
         if (ioctl(con->server->fd, FIONREAD, &b)) {
             g_warning("ioctl(%d, FIONREAD, ...) failed: %s", event_fd, strerror(errno));
@@ -4301,12 +4603,19 @@ process_self_event(server_connection_state_t *con, int events, int event_fd)
             }
         }
     } else if (events == EV_TIMEOUT) {
-        g_debug("%s:timeout, ev:%p", G_STRLOC, (&con->server->event));
+        g_debug("%s:timeout, ev:%p, state:%d", G_STRLOC, (&con->server->event), con->state);
         if (con->state == ST_ASYNC_CONN) {
             g_message("%s: self conn timeout, state:%d, con:%p, server:%p", G_STRLOC, con->state, con, con->server);
             con->state = ST_ASYNC_ERROR;
-            con->backend->state = BACKEND_STATE_DOWN;
-            g_message("%s: set backend:%p down", G_STRLOC, con->backend);
+            if (con->backend->type != BACKEND_TYPE_RW) {
+                if (con->srv->disable_threads) {
+                    con->backend->state = BACKEND_STATE_DOWN;
+                    g_get_current_time(&(con->backend->state_since));
+                    g_critical("%s: set backend:%p down", G_STRLOC, con->backend);
+                }
+            } else {
+                g_critical("%s: get conn timeout from master", G_STRLOC);
+            }
         }
     }
 
@@ -4321,8 +4630,18 @@ process_self_server_read(server_connection_state_t *con)
     case NETWORK_SOCKET_SUCCESS:
         break;
     case NETWORK_SOCKET_WAIT_FOR_EVENT:{
+        con->retry_cnt++;
+        if (con->retry_cnt >= MAX_TRY_NUM) {
+            con->state = ST_ASYNC_ERROR;
+            break;
+        }
+        struct timeval timeout;
+        timeout.tv_sec = 3;
+        timeout.tv_usec = 0;
+        g_debug("%s: set timeout:%d for new conn:%p", G_STRLOC,
+                (int)timeout.tv_sec, con);
         /* call us again when you have a event */
-        ASYNC_WAIT_FOR_EVENT(con->server, EV_READ, NULL, con);
+        ASYNC_WAIT_FOR_EVENT(con->server, EV_READ, &timeout, con);
         return 0;
     }
     case NETWORK_SOCKET_ERROR:
@@ -4387,12 +4706,10 @@ process_self_read_auth_result(server_connection_state_t *con)
         network_mysqld_queue_reset(con->server);
         network_queue_clear(con->server->recv_queue);
         con->server->is_multi_stmt_set = con->is_multi_stmt_set;
-#if NETWORK_DEBUG_TRACE_EVENT
-        CHECK_PENDING_EVENT(&(con->server->event));
-#endif
         if (con->srv->is_back_compressed) {
             con->server->do_compress = 1;
         }
+        CHECK_PENDING_EVENT(&(con->server->event));
         network_pool_add_idle_conn(con->pool, con->srv, con->server);
         con->server = NULL;     /* tell _self_con_free we succeed */
         network_mysqld_self_con_free(con);
@@ -4406,6 +4723,7 @@ process_self_read_auth_result(server_connection_state_t *con)
 static void
 network_mysqld_self_con_handle(int event_fd, short events, void *user_data)
 {
+    g_debug("%s:visit network_mysqld_self_con_handle", G_STRLOC);
     int ostate;
     server_connection_state_t *con = (server_connection_state_t *)user_data;
     chassis *srv = con->srv;
@@ -4427,25 +4745,45 @@ network_mysqld_self_con_handle(int event_fd, short events, void *user_data)
         case ST_ASYNC_CONN:
             switch (network_socket_connect_finish(con->server)) {
             case NETWORK_SOCKET_SUCCESS:
-                if (con->backend->state != BACKEND_STATE_UP) {
-                    con->backend->state = BACKEND_STATE_UP;
-                    g_get_current_time(&(con->backend->state_since));
-                    g_message(G_STRLOC ": set backend: %s (%p) up", con->backend->addr->name->str, con->backend);
+                if (con->srv->disable_threads) {
+                    if (con->backend->state != BACKEND_STATE_UP && srv->group_replication_mode == 0) {
+                        con->backend->state = BACKEND_STATE_UP;
+                        g_get_current_time(&(con->backend->state_since));
+                        g_message(G_STRLOC ": set backend: %s (%p) up", 
+                                con->backend->addr->name->str, con->backend);
+                    }
                 }
                 con->state = ST_ASYNC_READ_HANDSHAKE;
                 break;
             default:
                 con->state = ST_ASYNC_ERROR;
-                con->backend->state = BACKEND_STATE_DOWN;
-                g_message(G_STRLOC ": set backend: %s (%p) down", con->backend->addr->name->str, con->backend);
+                if (con->backend->type != BACKEND_TYPE_RW) {
+                    if (con->srv->disable_threads) {
+                        con->backend->state = BACKEND_STATE_DOWN;
+                        g_get_current_time(&(con->backend->state_since));
+                        g_critical(G_STRLOC ": set backend: %s (%p) down", 
+                                con->backend->addr->name->str, con->backend);
+                    }
+                } else {
+                    g_critical(G_STRLOC ": error when creating conn for backend: %s (%p)",
+                            con->backend->addr->name->str, con->backend);
+                }
                 break;
             }
             break;
         case ST_ASYNC_READ_HANDSHAKE:
             g_assert(events == 0 || event_fd == con->server->fd);
 
+            g_debug("%s: ST_ASYNC_READ_HANDSHAKE for con:%p, connection %s and %s",
+                G_STRLOC, con, con->server->src->name->str, con->server->dst->name->str);
+
+
             if (!process_self_server_read(con)) {
                 return;
+            }
+
+            if (con->state == ST_ASYNC_ERROR) {
+                break;
             }
 
             switch (proxy_self_read_handshake(srv, con)) {
@@ -4465,7 +4803,7 @@ network_mysqld_self_con_handle(int event_fd, short events, void *user_data)
             proxy_self_create_auth(srv, con);
             network_queue_clear(con->server->recv_queue);
 
-            switch (network_mysqld_write(con->srv, con->server)) {
+            switch (network_mysqld_write(con->server)) {
             case NETWORK_SOCKET_SUCCESS:
                 con->state = ST_ASYNC_READ_AUTH_RESULT;
                 break;
@@ -4499,6 +4837,11 @@ void
 network_connection_pool_create_conn(network_mysqld_con *con)
 {
     chassis *srv = con->srv;
+
+    if (srv->maintain_close_mode) {
+        return;
+    }
+
     chassis_private *g = srv->priv;
 
     int i;
@@ -4525,6 +4868,9 @@ network_connection_pool_create_conn(network_mysqld_con *con)
         if (backend != NULL) {
 
             if (backend->state != BACKEND_STATE_UP) {
+                if (backend->state != BACKEND_STATE_UNKNOWN) {
+                    continue;
+                }
                 if (backend->last_check_time == cur) {
                     g_debug("%s: omit create, backend:%d state:%d", G_STRLOC, i, backend->state);
                     continue;
@@ -4557,22 +4903,33 @@ network_connection_pool_create_conn(network_mysqld_con *con)
                 backend->last_check_time = cur;
                 continue;
             } else if (total >= pool->mid_idle_connections) {
+                int idle_conn = total - backend->connected_clients;
+                if (idle_conn > backend->connected_clients) {
+                    g_debug("%s: idle conn num is enough:%d, %d", G_STRLOC, idle_conn, backend->connected_clients);
+                    continue;
+                }
                 int is_need_to_create = 0;
                 switch (backend->type) {
-                case BACKEND_TYPE_RW:
-                    if (con->master_conn_shortaged) {
-                        is_need_to_create = 1;
-                    }
-                    break;
-                case BACKEND_TYPE_RO:
-                    if (con->slave_conn_shortaged) {
-                        is_need_to_create = 1;
-                    }
-                    break;
-                default:
-                    break;
+                    case BACKEND_TYPE_RW:
+                        if (con->master_conn_shortaged) {
+                            is_need_to_create = 1;
+                        } else {
+                            g_message("%s: master_conn_shortaged false", G_STRLOC);
+                        }
+                        break;
+                    case BACKEND_TYPE_RO:
+                        if (con->slave_conn_shortaged) {
+                            is_need_to_create = 1;
+                        } else {
+                            g_message("%s: slave_conn_shortaged false", G_STRLOC);
+                        }
+                        break;
+                    default:
+                        g_warning("%s: unknown type:%d", G_STRLOC, backend->type);
+                        break;
                 }
                 if (!is_need_to_create) {
+                    g_message("%s: is_need_to_create false", G_STRLOC);
                     continue;
                 }
             }
@@ -4615,7 +4972,7 @@ network_connection_pool_create_conn(network_mysqld_con *con)
                 break;
             }
             case NETWORK_SOCKET_SUCCESS:
-                if (backend->state != BACKEND_STATE_UP) {
+                if (scs->srv->disable_threads && backend->state != BACKEND_STATE_UP) {
                     backend->state = BACKEND_STATE_UP;
                     g_get_current_time(&(backend->state_since));
                     g_message("%s: set backend:%p, ndx:%d up", G_STRLOC, backend, i);
@@ -4625,15 +4982,22 @@ network_connection_pool_create_conn(network_mysqld_con *con)
                 break;
             default:
                 scs->backend->connected_clients--;
-                backend->state = BACKEND_STATE_DOWN;
-                g_get_current_time(&(backend->state_since));
+                if (scs->srv->disable_threads) {
+                    if (scs->backend->type != BACKEND_TYPE_RW) {
+                        backend->state = BACKEND_STATE_DOWN;
+                        g_message("%s: set backend ndx:%d down", G_STRLOC, i);
+                    } else {
+                        g_message("%s: error when creating conn for backend ndx:%d", G_STRLOC, i);
+                    }
+                    g_get_current_time(&(backend->state_since));
+                }
                 network_mysqld_self_con_free(scs);
-                g_message("%s: set backend ndx:%d down", G_STRLOC, i);
                 break;
             }
         }
     }
 }
+
 
 void
 network_connection_pool_create_conns(chassis *srv)
@@ -4644,7 +5008,23 @@ network_connection_pool_create_conns(chassis *srv)
     for (i = 0; i < network_backends_count(g->backends); i++) {
         network_backend_t *backend = network_backends_get(g->backends, i);
         if (backend != NULL) {
-            for (j = 0; j < backend->config->mid_conn_pool; j++) {
+            if (backend->state != BACKEND_STATE_UP && backend->state != BACKEND_STATE_UNKNOWN) {
+                continue;
+            }
+            int allowd_conn_num = backend->config->mid_conn_pool;
+
+            int total = backend->pool->cur_idle_connections + backend->connected_clients;
+            if (total >= allowd_conn_num) {
+                continue;
+            }
+
+            allowd_conn_num = allowd_conn_num - total;
+
+            if (allowd_conn_num > MAX_CREATE_CONN_NUM) {
+                allowd_conn_num = MAX_CREATE_CONN_NUM;
+            }
+
+            for (j = 0; j < allowd_conn_num; j++) {
                 server_connection_state_t *scs = network_mysqld_self_con_init(srv);
                 if (srv->disable_dns_cache)
                     network_address_set_address(scs->server->dst, backend->address->str);
@@ -4670,6 +5050,8 @@ network_connection_pool_create_conns(chassis *srv)
                           G_STRLOC, i, scs->server, scs);
 
                 scs->backend->connected_clients++;
+                int create_err = 0;
+
                 switch (network_socket_connect(scs->server)) {
                 case NETWORK_SOCKET_ERROR_RETRY:{
                     scs->state = ST_ASYNC_CONN;
@@ -4678,7 +5060,7 @@ network_connection_pool_create_conns(chassis *srv)
                     break;
                 }
                 case NETWORK_SOCKET_SUCCESS:
-                    if (backend->state != BACKEND_STATE_UP) {
+                    if (scs->srv->disable_threads && backend->state != BACKEND_STATE_UP) {
                         backend->state = BACKEND_STATE_UP;
                         g_message("%s: set backend:%p, ndx:%d up", G_STRLOC, backend, i);
                         g_get_current_time(&(backend->state_since));
@@ -4688,23 +5070,62 @@ network_connection_pool_create_conns(chassis *srv)
                     g_message("%s: set backend conn:%p read handshake", G_STRLOC, scs);
                     break;
                 default:
+                    create_err = 1;
                     scs->backend->connected_clients--;
                     network_mysqld_self_con_free(scs);
-                    backend->state = BACKEND_STATE_DOWN;
-                    g_get_current_time(&(backend->state_since));
-                    g_message("%s: set backend ndx:%d down, connected_clients sub", G_STRLOC, i);
+                    if (scs->srv->disable_threads) {
+                        if (scs->backend->type != BACKEND_TYPE_RW) {
+                            backend->state = BACKEND_STATE_DOWN;
+                            g_message("%s: set backend ndx:%d down, connected_clients sub", G_STRLOC, i);
+                        } else {
+                            g_message("%s: error when creating conn for backend ndx:%d", G_STRLOC, i);
+                        }
+                        g_get_current_time(&(backend->state_since));
+                    }
+                    break;
+                }
+
+                if (create_err) {
                     break;
                 }
             }
         }
     }
+
 }
 
 void
-network_mysqld_con_set_sharding_plan(network_mysqld_con *con, sharding_plan_t *plan)
+update_time_func(int fd, short what, void *arg)
 {
-    if (con->sharding_plan) {
-        sharding_plan_free(con->sharding_plan);
-    }
-    con->sharding_plan = plan;
+    chassis* chas = arg;
+
+    chas->current_time = time(0);
+
+    g_debug("%s: update time", G_STRLOC);
+    struct timeval update_time_interval = {1, 0};
+    chassis_event_add_with_timeout(chas, &chas->update_timer_event, &update_time_interval);
 }
+
+
+void
+check_and_create_conns_func(int fd, short what, void *arg)
+{
+    chassis *chas = arg;
+
+    if (!chas->maintain_close_mode) {
+        if (chas->is_need_to_create_conns) {
+            network_connection_pool_create_conns(chas);
+            chas->is_need_to_create_conns = 0;
+        } else {
+            if (chas->complement_conn_flag) {
+                network_connection_pool_create_conns(chas);
+                chas->complement_conn_flag = 0;
+            }
+        }
+    }
+
+    g_debug("%s: check_and_create_conns_func", G_STRLOC);
+    struct timeval check_interval = {30, 0};
+    chassis_event_add_with_timeout(chas, &chas->auto_create_conns_event, &check_interval);
+}
+

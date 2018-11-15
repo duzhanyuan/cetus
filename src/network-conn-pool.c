@@ -64,10 +64,7 @@ network_connection_pool_entry_free(network_connection_pool_entry *e, gboolean fr
 
     if (e->sock && free_sock) {
         network_socket *sock = e->sock;
-
-        g_debug("%s:event del, ev:%p", G_STRLOC, &(sock->event));
-        event_del(&(sock->event));
-        network_socket_free(sock);
+        network_socket_send_quit_and_free(sock);
     }
 
     g_free(e);
@@ -108,7 +105,7 @@ network_connection_pool_new(void)
 
     pool->max_idle_connections = 20;
     pool->mid_idle_connections = 10;
-    pool->min_idle_connections = 2;
+    pool->min_idle_connections = 1;
     pool->cur_idle_connections = 0;
     pool->users = g_hash_table_new_full(g_hash_table_string_hash,
                                         g_hash_table_string_equal, g_hash_table_string_free, g_queue_free_all);
@@ -201,13 +198,13 @@ network_connection_pool_get(network_connection_pool *pool, GString *username, in
     if (conns) {
         if (conns->length > 0) {
             entry = g_queue_pop_head(conns);
-            g_debug("%s: (get) entry for user '%s' -> %p, now:%ld",
-                    G_STRLOC, username ? username->str : "", entry, time(0));
+            g_debug("%s: (get) entry for user '%s' -> %p",
+                    G_STRLOC, username ? username->str : "", entry);
         } else {
             g_debug("%s: conns length is zero for user '%s'", G_STRLOC, username ? username->str : "");
         }
     } else {
-        g_message("%s: conns is null for user '%s'", G_STRLOC, username ? username->str : "");
+        g_debug("%s: conns is null for user '%s'", G_STRLOC, username ? username->str : "");
     }
 
     if (!entry) {

@@ -55,9 +55,12 @@
 typedef enum {
     NETWORK_SOCKET_SUCCESS,
     NETWORK_SOCKET_WAIT_FOR_EVENT,
+    NETWORK_SOCKET_WAIT_FOR_WRITABLE,
     NETWORK_SOCKET_ERROR,
     NETWORK_SOCKET_ERROR_RETRY
 } network_socket_retval_t;
+
+#define MAX_QUERY_CACHE_SIZE 65536
 
 typedef struct network_mysqld_auth_challenge network_mysqld_auth_challenge;
 typedef struct network_mysqld_auth_response network_mysqld_auth_response;
@@ -97,15 +100,19 @@ typedef struct {
     int query_status;
 } server_query_status;
 
+typedef struct network_ssl_connection_s network_ssl_connection_t;
+
 typedef struct {
+    int socket_type; /**< SOCK_STREAM or SOCK_DGRAM for now */
     int fd;             /**< socket-fd */
-    guint32 last_visit_time;
+    guint32 create_time;
+    guint32 update_time;
+
     struct event event; /**< events for this fd */
 
     network_address *src; /**< getsockname() */
     network_address *dst; /**< getpeername() */
 
-    int socket_type; /**< SOCK_STREAM or SOCK_DGRAM for now */
 
     /**< internal tracking of the packet_id's the automaticly set the next good packet-id */
     guint8 last_packet_id;
@@ -117,14 +124,18 @@ typedef struct {
     network_queue *recv_queue;
     network_queue *recv_queue_raw;
     network_queue *recv_queue_uncompress_raw;
+    network_queue *recv_queue_decrypted_raw;
+
     network_queue *send_queue;
+    network_queue *send_queue_compressed;
     network_queue *cache_queue;
+
     GString *last_compressed_packet;
     int compressed_unsend_offset;
+    int total_output;
 
     off_t to_read;
-    off_t resp_len;
-    int total_output;
+    long long resp_len;
 
     /**
      * data extracted from the handshake  
@@ -175,17 +186,20 @@ typedef struct {
     server_state_data parse;
     server_query_status qstat;
 
+    network_ssl_connection_t* ssl;
+
 } network_socket;
 
 NETWORK_API network_socket *network_socket_new(void);
 NETWORK_API void network_socket_free(network_socket *s);
 NETWORK_API network_socket_retval_t network_socket_write(network_socket *con, int send_chunks);
+NETWORK_API void network_socket_send_quit_and_free(network_socket *s);
 NETWORK_API network_socket_retval_t network_socket_read(network_socket *con);
 NETWORK_API network_socket_retval_t network_socket_to_read(network_socket *sock);
 NETWORK_API network_socket_retval_t network_socket_set_non_blocking(network_socket *sock);
 NETWORK_API network_socket_retval_t network_socket_connect(network_socket *con);
 NETWORK_API network_socket_retval_t network_socket_connect_finish(network_socket *sock);
-NETWORK_API network_socket_retval_t network_socket_bind(network_socket *con);
+NETWORK_API network_socket_retval_t network_socket_bind(network_socket *con, int advanced_mode);
 NETWORK_API network_socket *network_socket_accept(network_socket *srv, int *reason);
 NETWORK_API network_socket_retval_t network_socket_set_send_buffer_size(network_socket *sock, int size);
 

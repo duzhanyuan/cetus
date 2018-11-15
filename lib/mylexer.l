@@ -212,11 +212,11 @@ HEX_DIGIT [0-9a-fA-F]
 "UNCOMMITTED"         return TK_UNCOMMITTED;
 "SERIALIZABLE"        return TK_SERIALIZABLE;
 "REPEATABLE"          return TK_REPEATABLE;
-"TRIM"                return TK_TRIM;
+"TRIM("                return TK_TRIM; //special function
+"POSITION("            return TK_POSITION; //special function
 "BOTH"                return TK_TRIM_SPEC;
 "LEADING"             return TK_TRIM_SPEC;
 "TRAILING"            return TK_TRIM_SPEC;
-"POSITION"            return TK_POSITION;
 "TRUNCATE"            return TK_TRUNCATE;
 "XA"                  return TK_XA;
 "RECOVER"             return TK_RECOVER;
@@ -231,6 +231,9 @@ HEX_DIGIT [0-9a-fA-F]
 "CETUS_SEQUENCE"      return TK_CETUS_SEQUENCE;
 "CETUS_VERSION"       return TK_CETUS_VERSION;
 "WARNINGS"            return TK_WARNINGS;
+"_binary"             return TK_UNDERSCORE_CHARSET;
+"_latin1"             return TK_UNDERSCORE_CHARSET;
+"_utf8"               return TK_UNDERSCORE_CHARSET;
 
 [0-9]+                 return TK_INTEGER; /*sign symbol is handled in parser*/
 0[xX]{HEX_DIGIT}+      return TK_INTEGER;
@@ -254,7 +257,7 @@ HEX_DIGIT [0-9a-fA-F]
 <PROPERTY>\"([^"\\]|\"\"|\\.)*\"   return TK_STRING;
 <PROPERTY>'([^'\\]|\\.|'')*'     return TK_STRING;
 <PROPERTY>[ \t\n\r,;]+ /* ignore */
-<PROPERTY>. { g_warning("### bad char in property comment: %02x\n", yytext[0]);}
+<PROPERTY>. { g_warning("### bad char in property comment: %02x", yytext[0]);}
 <PROPERTY>"*"+"/" { BEGIN(INITIAL); return TK_PROPERTY_END;}
 
 
@@ -272,7 +275,7 @@ HEX_DIGIT [0-9a-fA-F]
 "#".*  { /* useless comment */ }
 "--"[ \t\n].*  { /* useless comment */ }
 
-.   {g_warning("### flex: bad input character: %02x\n", yytext[0]);return 0;}
+.   {g_warning("### flex: bad input character: %02x", yytext[0]);return 0;}
 
 %%
 /*hack function to restore user allocated string.

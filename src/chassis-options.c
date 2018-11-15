@@ -67,7 +67,12 @@ int
 chassis_option_set(chassis_option_t *opt,
                    const char *long_name,
                    gchar short_name,
-                   gint flags, enum option_type arg, gpointer arg_data, const char *description, const char *arg_desc)
+                   gint flags,
+                   enum option_type arg,
+                   gpointer arg_data,
+                   const char *description,
+                   const char *arg_desc,
+                   chas_opt_assign_hook assign_hook, chas_opt_show_hook show_hook, gint opt_property)
 {
     opt->long_name = long_name;
     opt->short_name = short_name;
@@ -76,73 +81,12 @@ chassis_option_set(chassis_option_t *opt,
     opt->arg_data = arg_data;
     opt->description = description;
     opt->arg_description = arg_desc;
+    opt->assign_hook = assign_hook;
+    opt->show_hook = show_hook;
+    opt->opt_property = opt_property;
     return 0;
 }
 
-char *
-chassis_option_get_value_str(chassis_option_t *opt)
-{
-    gchar *value = NULL;
-    switch (opt->arg) {
-    case OPTION_ARG_NONE:
-        value = g_strdup((*(gint *)opt->arg_data) ? "true" : "false");
-        break;
-    case OPTION_ARG_INT:
-        value = g_strdup_printf("%u", *(gint *)(opt->arg_data));
-        break;
-    case OPTION_ARG_INT64:
-        value = g_strdup_printf("%lu", *(gint64 *)(opt->arg_data));
-        break;
-    case OPTION_ARG_DOUBLE:
-        value = g_strdup_printf("%f", *(double *)(opt->arg_data));
-        break;
-    case OPTION_ARG_STRING:
-        value = g_strdup(*(char **)opt->arg_data);
-        break;
-    default:
-        value = g_strdup("error value");
-    }
-    return value;
-}
-
-gboolean
-chassis_option_set_value(chassis_option_t *opt, const char *value)
-{
-    switch (opt->arg) {
-    case OPTION_ARG_NONE:
-        if (strcasecmp(value, "true") == 0 || strcasecmp(value, "1") == 0) {
-            *(gint *)opt->arg_data = 1;
-            return TRUE;
-        } else if (strcasecmp(value, "false") == 0 || strcasecmp(value, "0") == 0) {
-            *(gint *)opt->arg_data = 0;
-            return TRUE;
-        } else {
-            return FALSE;
-        }
-    case OPTION_ARG_INT:{
-        char *endptr = NULL;
-        int num = strtol(value, &endptr, 0);
-        if (endptr[0] == '\0') {
-            *(gint *)opt->arg_data = num;   /* TODO: apply lower/upper bounds */
-            return TRUE;
-        } else {
-            return FALSE;
-        }
-    }
-    case OPTION_ARG_INT64:{
-        char *endptr = NULL;
-        gint64 num = strtoll(value, &endptr, 0);
-        if (endptr[0] == '\0') {
-            *(gint64 *)opt->arg_data = num; /* TODO: apply lower/upper bounds */
-            return TRUE;
-        } else {
-            return FALSE;
-        }
-    }
-    default:
-        return FALSE;
-    }
-}
 
 /**
  * create a command-line option
@@ -181,32 +125,27 @@ int
 chassis_options_add(chassis_options_t *opts,
                     const char *long_name,
                     gchar short_name,
-                    int flags, enum option_type arg, gpointer arg_data, const char *description, const char *arg_desc)
+                    int flags,
+                    enum option_type arg,
+                    gpointer arg_data,
+                    const char *description,
+                    const char *arg_desc,
+                    chas_opt_assign_hook assign_hook, chas_opt_show_hook show_hook, gint opt_property)
 {
     chassis_option_t *opt = chassis_option_new();
     if (0 != chassis_option_set(opt,
                                 long_name,
                                 short_name,
                                 flags,
-                                arg, arg_data, description, arg_desc) || 0 != chassis_options_add_option(opts, opt)) {
+                                arg,
+                                arg_data,
+                                description,
+                                arg_desc, assign_hook, show_hook, opt_property) || 0 != chassis_options_add_option(opts, opt)) {
         chassis_option_free(opt);
         return -1;
     } else {
         return 0;
     }
-}
-
-chassis_option_t *
-chassis_options_get(GList *opts, const char *long_name)
-{
-    GList *l = opts;
-    for (l = opts; l; l = l->next) {
-        chassis_option_t *opt = l->data;
-        if (strcmp(opt->long_name, long_name) == 0) {
-            return opt;
-        }
-    }
-    return NULL;
 }
 
 #define NO_ARG(entry) ((entry)->arg == OPTION_ARG_NONE)
@@ -843,4 +782,16 @@ chassis_options_parse_cmdline(chassis_options_t *context, int *argc, char ***arg
     free_changes_list(context, TRUE);
     free_pending_nulls(context, FALSE);
     return FALSE;
+}
+
+chassis_option_t *chassis_options_get(GList *opts, const char *long_name)
+{
+    GList *l = opts;
+    for (l = opts; l; l = l->next) {
+        chassis_option_t *opt = l->data;
+        if (strcmp(opt->long_name, long_name)==0) {
+            return opt;
+        }
+    }
+    return NULL;
 }

@@ -1,6 +1,13 @@
 # 启动配置选项
 
 ## 常规配置
+### worker-processes
+
+Default: 1
+
+启动worker进程的数量，启动的数量最好小于等于cpu数目
+
+> worker-processes = 4
 
 ### daemon
 
@@ -28,7 +35,7 @@ Default: root
 
 Default: conf
 
-配置文件路径，包括：用户设置文件、变量处理配置文件、分库版本的分片规则配置文件、读写分离版本的启动配置文件和分库版本的启动配置文件。
+JSON配置文件路径，JSON文件包括包括：账号配置文件、变量处理配置文件、分库版本的分片规则配置文件
 
 > conf-dir = /usr/lib/cetus/conf
 
@@ -64,7 +71,7 @@ PID文件路径
 
 ### log-xa-file
 
-xa日志路径
+xa日志路径（分库中有效）
 
 > log-xa-file = logs/cetus.log
 
@@ -72,7 +79,7 @@ xa日志路径
 
 Default: false
 
-记录xa日志详情
+记录xa日志详情（分库中有效）
 
 > log-xa-in-detail = true
 
@@ -146,7 +153,7 @@ Default: : 2 (seconds)
 
 ### proxy-read-timeout
 
-Default: : 10 (minutes)
+Default: : 600 (seconds)
 
 读Proxy的超时时间
 
@@ -154,7 +161,7 @@ Default: : 10 (minutes)
 
 ### proxy-write-timeout
 
-Default: : 10 (minutes)
+Default: : 600 (seconds)
 
 写Proxy的超时时间
 
@@ -176,7 +183,9 @@ Default: : 10 (minutes)
 
 Default: 100
 
+每个worker进程启动时允许创建的连接数
 当前连接数不足此值时，会自动创建连接
+最小只能设置为10，如果设置小于10，则实际该值为10
 
 > default-pool-size = 200
 
@@ -184,9 +193,17 @@ Default: 100
 
 Default: default-pool-size * 2
 
-连接池的最大连接数，超过此数目的连接不会放入连接池
+每个worker进程允许创建的最大连接数，包括连接池里的空闲连接和正在使用的连接
 
 > max-pool-size = 300
+
+### max-alive-time
+
+Default: 7200 (seconds)
+
+后端连接最大存活时间
+
+> max-alive-time = 7200
 
 ### max-resp-size
 
@@ -194,7 +211,7 @@ Default: 10485760 (10MB)
 
 每个后端返回结果集的最大数量
 
-> max-resp-size = 1024
+> max-resp-size = 1048576
 
 ### master-preferred
 
@@ -202,9 +219,9 @@ Default: 10485760 (10MB)
 
 Proxy在读写分离时可以指定访问的库
 
-参数未设置时，没有限制；设置为ture时仅访问读写后端(主库)
+参数未设置时，没有限制；设置为true时仅访问读写后端(主库)，除非利用注释强制走从库
 
-> master-preferred = ture
+> master-preferred = true
 
 ### read-master-percentage
 
@@ -212,45 +229,17 @@ Proxy在读写分离时可以指定访问的库
 
 > read-master-percentage = 50
 
-### disable-auto-connect
-
-Default: false
-
-禁用自动创建连接，连接将在新请求到来时创建
-
-> disable-auto-connect = false
-
 ### reduce-connections
 
-允许减少无效连接
+自动减少空闲连接
 
-> reduce-connections = ture
-
-### enable-reset-connection
-
-允许重启连接
-
-> enable-reset-connection = ture
-
-### all-write-mode
-
-Default: ture
-
-发送更新/删除/插入到所有的默认组
-
-> enable-reset-connection = ture
-
-### disable-dist-tran-mode
-
-禁用分布式事务
-
-> disable-dist-tran-mode ＝ ture
+> reduce-connections = true
 
 ### default-charset
 
 默认数据库字符标码方式
 
-> default-charset = gbk
+> default-charset = utf8
 
 ### enable-client-found-rows
 
@@ -262,9 +251,10 @@ Default: false
 
 ### worker_id
 
-自增guid的worker id，最大值为63最小值为1
+只针对分库版本有效
+不同cetus实例的id号必须是不一样，否则容易有冲突
 
-> worker_id = 4
+> worker_id = 1
 
 ## Admin配置
 
@@ -302,11 +292,102 @@ Default: :4041
 
 ## 远端配置中心
 
-可选择配置远端db，通过配置中心获取分库模式的配置
+在同一Cetus集群，当Cetus实例数量较多时候，各个实例的本地配置文件的统一管理会变得复杂。Cetus除了提供通过本地配置文件的方式启动外，还提供了通过远程配置中心的方式启动。
+
+远程配置中心中可以配置与本地配置文件中相同的启动参数，各个Cetus实例启动时，指定远程配置中心的url获取配置信息启动。这样就保证了同一个Cetus集群中各个Cetus实例启动配置的一致性。
+
+目前Cetus的两个版本（读写分离版本和分库版本）均支持远程配置中心启动。
+
+远程配置中心涉及3张表`settings`、`objects`和`services`，当这些表不存在时，Cetus会自动创建，但是在启动的时候，需要配置合理的参数，否则Cetus可能启动不起来，需要查看Cetus日志来查看具体报错问题。下面依次介绍这些表的作用。
+
+- `settings`表
+
+该表主要存储启动时加载的配置信息，即对应本地配置文件`proxy.conf`。其表结构如下：
+
+> CREATE TABLE `settings` (
+> 
+>  `option_key` varchar(64) NOT NULL,
+> 
+>  `option_value` varchar(1024) NOT NULL,
+> 
+>  PRIMARY KEY (`option_key`)
+> 
+>)
+
+在该表中，可以配置各种启动配置参数，例如：
+
+```
+replace into `settings` values ("admin-address", "0.0.0.0:6003");
+replace into `settings` values ("admin-password", "admin");
+replace into `settings` values ("admin-username", "admin");
+replace into `settings` values ("basedir", "/home/ght/cetus_install");
+replace into `settings` values ("conf-dir", "/home/ght/cetus_install/conf");
+replace into `settings` values ("default-db", "test");
+replace into `settings` values ("default-username", "ght");
+replace into `settings` values ("log-file", "/home/ght/cetus_install/cetus.log");
+replace into `settings` values ("plugin-dir", "/home/ght/cetus_install/lib/cetus/plugins");
+replace into `settings` values ("plugins", "proxy,admin");
+replace into `settings` values ("proxy-backend-addresses", "192.0.0.1:3306@data1,192.0.0.2:3306@data2,192.0.0.3:3306@data3,192.0.0.4:3306@data4");
+```
+
+- `objects`表
+
+该表主要存储账号信息和分片信息，即对应本地配置文件的`users.json`文件和`sharding.json`文件。其表结构如下：
+
+>CREATE TABLE `objects` (
+>
+>  `object_name` varchar(64) NOT NULL,
+> 
+>  `object_value` text NOT NULL,
+> 
+>  `mtime` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+> 
+>  PRIMARY KEY (`object_name`)
+> 
+> )
+
+在该表中，可以配置账户信息和分表规则信息，其中`object_values`存储的其实是json格式，例如：
+
+```
+replace into `objects` values ("sharding", '{"vdb": [{"id": 1,"type": "int","method": "hash","num": 8,"partitions": {"data1": [0,1], "data2": [2,3], "data3": [4,5], "data4": [6,7]}},{ "id": 2,"type": "int","method": "range","num": 0,"partitions": {"data1": 124999, "data2": 249999, "data3": 374999,"data4": 499999}}],"table": [{"vdb": 1, "db": "employees_hash", "table": "dept_emp", "pkey": "emp_no"},{"vdb": 1, "db": "employees_hash", "table": "employees", "pkey": "emp_no"},{"vdb": 1, "db": "employees_hash", "table": "titles", "pkey": "emp_no"},{"vdb": 2, "db":"employees_range", "table": "dept_emp", "pkey": "emp_no"},{"vdb": 2, "db": "employees_range", "table": "employees", "pkey": "emp_no"},{"vdb": 2, "db":"employees_range", "table": "titles", "pkey": "emp_no"}],"single_tables": [{"table": "regioncode", "db": "employees_hash", "group": "data1"},{"table": "countries",  "db": "employees_range", "group": "data2"}]}', now());
+
+replace into `objects` values ("users", '{"users":[{"user": "ght","client_pwd":"Zxcvbnm,lp-1234","server_pwd":"Zxcvbnm,lp-1234"}, {"user": "tmp","client_pwd":"Zxcvbnm,lp-1234","server_pwd":"Zxcvbnm,lp-12345"}, {"user": "test2","client_pwd":"123456","server_pwd":   "Zxcvbnm,lp-1234"}, {"user": "dbtest","client_pwd":"Zxcvbnm,lp-1234","server_pwd":"Zxcvbnm,lp-1234"}]}', now());
+```
+
+- `services`表
+
+该表主要用于存储Cetus启动时间。该表是Cetus启动的时候由Cetus自己写入的，所以不需要用户配置。其表结构如下：
+
+>CREATE TABLE `services` (
+>
+>  `id` varchar(64) NOT NULL,
+> 
+>  `data` varchar(64) NOT NULL,
+> 
+>  `start_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+> 
+>  PRIMARY KEY (`id`)
+
+该表中的`id`字段记录了Cetus插件监听的IP/PORT，`data`字段记录了插件名称，`start_time`字段则记录了插件的启动时间。例如启动Cetus后，表中数据可能类似下面所示：
+
+```
+mysql> select * from services;
++--------------+-------+---------------------+
+| id           | data  | start_time          |
++--------------+-------+---------------------+
+| 0.0.0.0:6003 | admin | 2018-07-11 11:59:05 |
+| :4040        | proxy | 2018-07-11 11:59:06 |
++--------------+-------+---------------------+
+2 rows in set (0.00 sec)
+```
+
+
+在Cetus启动的时候，则不需要再指定`--defaults-file`，而是指定远端配置中心的url即可`remote-conf-url`。
+
 
 ### remote-conf-url
 
-远端配置中心信息
+- 远端配置中心信息书写格式如下：
 
 > remote-conf-url = mysql://dbuser:dbpassword@host:port/schema
 
@@ -316,39 +397,65 @@ Default: :4041
 
 配置中心端口port可选填，默认3306
 
+- 启动命令类似如下：
+
+> /home/ght/cetus_install/libexec/cetus --remote-conf-url=mysql://ght:123456@172.17.0.1:3306/test
+ 
+### 重新load配置
+当配置中心的某些配置需要修改，而需要Cetus重新加载修改后的配置时候，并不需要重新启动Cetus，Cetus的admin端口提供了重新读取配置中心配置信息的功能。
+
+当修改表`settings`中的配置信息时，可以通过在Cetus的admin端口执行`config reload`命令，使Cetus重新从配置中心拉取配置信息，使得配置中心新修改的配置在Cetus上生效。
+
+当修改表`objects`中的账号信息时，可以通过在Cetus的admin端口执行`config reload user`、`config reload variables`命令，使Cetus重新从配置中心拉取账号信息、静默处理的变量信息，使其在Cetus上生效。
+
+**注意** ：目前cetus执行reload操作与远程配置库进行交互时，连接、读、写超时均为1秒，即如果由于远程配置库负载过大、网络抖动等原因导致超时超过1秒，会reload操作失败。与此同时，reload操作目前和SQL处理的线程为同一个线程，所以尽量少用该命令，或是业务低峰期使用该命令，后续会将其修改成异步形式，彻底不影响SQL的处理。
+
+
 ## 辅助线程配置
 
 ### disable-threads
 
 Default: false
 
-禁用辅助线程，包括: 配置变更检测、后端存活检测和只读库延迟检测等
+禁用辅助线程，包括: 后端存活检测、只读库延迟检测、MGR节点状态和角色检测等
 
 > disable-threads = true
 
 ### check-slave-delay
 
-Default: false
+Default: true
 
-是否检查从库延迟
+是否检查从库延迟。注意，cetus的延迟检测只单纯检测主从之间的延迟毫秒数（主库写入时间戳，从库读取时间戳，与本地时间做差值，计算主从延迟），而非检测io_thread/sql_thread是否正常工作。
 
-> check-slave-delay = true
+> check-slave-delay = false
 
 ### slave-delay-down
 
-Default: 60 (seconds)
+Default: 10 (seconds)
 
 从库延迟超过该秒，状态将被设置为DOWN
 
-> slave-delay-down = 120
+> slave-delay-down = 15
 
 ### slave-delay-recover
 
-Default: slave-delay-down / 2  (seconds)
+Default: 1  (seconds)
 
 从库延迟少于该秒数，状态将恢复为UP
 
-> slave-delay-recover = 30
+> slave-delay-recover = 5
+
+**注：slave-delay-recover必须比slave-delay-down小，若用户配置的slave-delay-recover比slave-delay-down大则默认设置slave-delay-recover与slave-delay-down相等**
+
+## MGR配置
+
+### group-replication-mode
+
+Default: 0 (普通MySQL集群)
+
+当后端MySQL集群是单主模式的MGR时，该参数设置为1，Cetus可以自动检测MGR集群的主从状态及节点主从角色变换。目前Cetus只支持单主MGR模式。
+
+> group-replication-mode = 1
 
 ## 其它
 
@@ -380,7 +487,7 @@ Default: 根据操作系统
 
 Default: 33554432 (32MB)
 
-最大允许的包大小
+最大允许报文大小
 
 > max-allowed-packet = 1024
 
@@ -396,7 +503,7 @@ Default: false
 
 Default: 65536 (millisecond)
 
-最长查询时间(毫秒)
+慢查询记录阈值(毫秒)
 
 > long-query-time = 500
 
@@ -414,13 +521,13 @@ Default: false
 
 启用后端传给Cetus的结果集压缩，一般不启用
 
-> enable-back-compress ＝ ture
+> enable-back-compress ＝ true
 
 ### merged-output-size
 
 Default: 8192
 
-tcp流式结果集合并输出大小
+tcp流式结果集合并输出阈值，超过此大小，则输出
 
 > merged-output-size = 2048
 
@@ -428,20 +535,40 @@ tcp流式结果集合并输出大小
 
 Default: 100
 
-Proxy连接后端的超时时间
+设置query cache的默认超时时间，单位为ms
 
 > default-query-cache-timeout = 60
 
 ### enable-query-cache
 
+Default: false
+
 开启Proxy请求缓存
 
-> enable-query-cache = ture
+> enable-query-cache = true
 
 ### max-header-size
 
 Default:  65536
 
-tcp-stream最大报头大小
+设置响应中header最大大小，供tcp stream使用，如果响应头部特别大，需要设置更大的大小
 
-> max-header-size = 1024
+> max-header-size = 131072
+
+### enable-tcp-stream
+
+Default: false
+
+采用tcp stream来输出响应，规避内存炸裂等问题
+
+> enable-tcp-stream = true
+
+### ssl
+
+Default: false
+
+前端支持SSL连接。需要在 `--conf-dir` 中提供：
+- 私钥：`server-key.pem`
+- 公钥证书：`server-cert.pem`
+这两个文件可以使用[mysql工具生成](https://dev.mysql.com/doc/refman/8.0/en/creating-ssl-rsa-files-using-mysql.html)，
+生成之后拷贝到`conf-dir`目录，程序会按照这两个固定名称加载文件。

@@ -102,22 +102,6 @@ sql_filter_vars_destroy()
 }
 
 gboolean
-sql_filter_vars_load_rules(char *filename)
-{
-    char *buffer = NULL;
-
-    if (read_file_to_buffer(filename, &buffer) == FALSE) {
-        g_free(buffer);
-        return FALSE;
-    }
-
-    gboolean rc = sql_filter_vars_load_str_rules(buffer);
-    g_free(buffer);
-
-    return rc;
-}
-
-gboolean
 str_case_equal(gconstpointer v1, gconstpointer v2)
 {
     if (!v1 || !v2)
@@ -314,4 +298,18 @@ sql_filter_vars_shard_load_default_rules()
         "      \"type\": \"string\"," "      \"allowed_values\": [\"*\"]" "    }" "  ]" "}";
     gboolean rc = sql_filter_vars_load_str_rules(default_var_rule);
     g_assert(rc);
+}
+
+gboolean
+sql_filter_vars_reload_str_rules(const char *json_str)
+{
+    if (!json_str) {
+        return FALSE;
+    }
+
+    if (cetus_variables) {
+        g_hash_table_remove_all(cetus_variables);
+    }
+
+    return sql_filter_vars_load_str_rules(json_str);
 }

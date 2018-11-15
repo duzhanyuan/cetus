@@ -120,6 +120,7 @@ enum sql_clause_flag_t {
     CF_LOCAL_QUERY = 0x20,
     CF_DISTINCT_AGGR = 0x40,
     CF_SUBQUERY = 0x80,
+    CF_AGGREGATE = 0x0100,
 };
 
 enum sql_sort_order_t {
@@ -143,7 +144,7 @@ enum sql_expr_flags_t {
     EP_AGGREGATE = 0x1000,
 };
 
-enum sql_func_type_t {
+enum sql_aggregate_type_t {
     FT_UNKNOWN = 0,
     FT_COUNT,
     FT_SUM,
@@ -217,6 +218,9 @@ struct sql_insert_t {
     sql_src_list_t *table;
     sql_select_t *sel_val;      /* [1] select...  [2] values(...) */
     sql_id_list_t *columns;
+    sql_expr_list_t *update_list; /* ON DUPLICATE KEY UPDATE ... */
+    const char *columns_start; /* [start, end) span of columns */
+    const char *columns_end;
 };
 
 struct sql_column_t {
@@ -272,6 +276,10 @@ gboolean sql_expr_is_function(const sql_expr_t *p, const char *func_name);
 
 gboolean sql_expr_is_dotted_name(const sql_expr_t *p, const char *prefix, const char *suffix);
 
+void sql_expr_get_dotted_names(const sql_expr_t *p, char *db, int db_len,
+                               char *table, int tb_len,
+                               char *col, int col_len);
+
 gboolean sql_expr_is_field_name(const sql_expr_t *p);
 
 sql_expr_list_t *sql_expr_list_append(sql_expr_list_t *list, sql_expr_t *expr);
@@ -281,7 +289,9 @@ sql_expr_t *sql_expr_list_find(sql_expr_list_t *list, const char *name);
 sql_expr_t *sql_expr_list_find_fullname(sql_expr_list_t *list, const sql_expr_t *expr);
 
 int sql_expr_list_find_aggregates(sql_expr_list_t *list, group_aggr_t * aggr_array);
-int sql_expr_list_find_aggregate(sql_expr_list_t *list);
+int sql_expr_list_find_aggregate(sql_expr_list_t *list, const char *target);
+
+int sql_expr_list_find_exact_aggregate(sql_expr_list_t *list, const char *target, int len);
 
 void sql_expr_list_free(sql_expr_list_t *list);
 
@@ -327,7 +337,7 @@ void sql_statement_free(void *clause, sql_stmt_type_t stmt_type);
 
 gboolean sql_is_quoted_string(const char *s);
 
-enum sql_func_type_t sql_func_type(const char *s);
+enum sql_aggregate_type_t sql_aggregate_type(const char *s);
 
 gboolean sql_expr_equals(const sql_expr_t *, const sql_expr_t *);
 

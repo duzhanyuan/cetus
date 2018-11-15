@@ -38,19 +38,23 @@ typedef enum {
     BACKEND_STATE_DOWN,
     BACKEND_STATE_MAINTAINING,
     BACKEND_STATE_DELETED,
+    BACKEND_STATE_OFFLINE
 } backend_state_t;
+
+#define NO_PREVIOUS_STATE -1
 
 typedef enum {
     BACKEND_TYPE_UNKNOWN,
     BACKEND_TYPE_RW,
-    BACKEND_TYPE_RO,
+    BACKEND_TYPE_RO
 } backend_type_t;
 
 typedef enum {
-    BACKEND_ALGO_ROUND_ROBIN,
-    BACKEND_ALGO_RANDOM,
-    BACKEND_ALGO_FIRST,
-} backend_algo_t;
+    BACKEND_OPERATE_SUCCESS,
+    BACKEND_OPERATE_NETERR,
+    BACKEND_OPERATE_DUPLICATE,
+    BACKEND_OPERATE_2MASTER
+} backend_operate_t;
 
 typedef struct backend_config {
     GString *default_username;
@@ -78,21 +82,17 @@ typedef struct {
     /**< number of open connections to this backend for SQF */
     int connected_clients;
 
-    /**< the UUID of the backend */
-    GString *uuid;
-
     backend_config *config;
-    GPtrArray *challenges;
+
     time_t last_check_time;
     int slave_delay_msec;       /* valid if this is a ReadOnly slave */
+    GString *server_version;
 } network_backend_t;
 
 NETWORK_API network_backend_t *network_backend_new();
 NETWORK_API void network_backend_free(network_backend_t *b);
 NETWORK_API int network_backend_conns_count(network_backend_t *b);
 NETWORK_API int network_backend_init_extra(network_backend_t *b, chassis *chas);
-void network_backend_save_challenge(network_backend_t *b, const network_mysqld_auth_challenge *);
-network_mysqld_auth_challenge *network_backend_get_challenge(network_backend_t *b);
 
 typedef struct {
     unsigned int ro_server_num;
@@ -108,10 +108,10 @@ typedef struct {
 
 NETWORK_API network_backends_t *network_backends_new();
 NETWORK_API void network_backends_free(network_backends_t *);
-NETWORK_API int network_backends_add(network_backends_t *, const gchar *, backend_type_t, backend_state_t, void *);
+NETWORK_API int network_backends_add(network_backends_t *, const gchar *, backend_type_t, backend_state_t, chassis *);
 NETWORK_API int network_backends_remove(network_backends_t *bs, guint index);
 NETWORK_API int network_backends_check(network_backends_t *bs);
-NETWORK_API int network_backends_modify(network_backends_t *, guint, backend_type_t, backend_state_t);
+NETWORK_API int network_backends_modify(network_backends_t *, guint, backend_type_t, backend_state_t, backend_state_t);
 NETWORK_API network_backend_t *network_backends_get(network_backends_t *bs, guint ndx);
 NETWORK_API guint network_backends_count(network_backends_t *bs);
 NETWORK_API gboolean network_backends_load_user_profile(network_backends_t *, chassis *);
@@ -121,7 +121,7 @@ NETWORK_API gboolean network_backends_load_config(network_backends_t *, chassis 
 /* get backend index by ip:port string */
 int network_backends_find_address(network_backends_t *bs, const char *);
 
-network_mysqld_auth_challenge *network_backends_get_challenge(network_backends_t *b, int back_ndx);
+void network_backends_server_version(network_backends_t *b, GString* version);
 
 #define MAX_GROUP_SLAVES 4
 
@@ -129,7 +129,9 @@ typedef struct network_group_t {
     GString *name;
     network_backend_t *master;
     network_backend_t *slaves[MAX_GROUP_SLAVES];
-    int nslaves;
+    gint nslaves;
+    network_backend_t *unknown[MAX_GROUP_SLAVES];
+    gint nunknown;
     unsigned int slave_visit_cnt;
 } network_group_t;
 
@@ -140,11 +142,13 @@ network_backend_t *network_group_pick_slave_backend(network_group_t *);
 
 void network_group_get_slave_names(network_group_t *, GString *);
 
-int network_backends_get_ro_ndx(network_backends_t *, backend_algo_t);
+int network_backends_get_ro_ndx(network_backends_t *);
 
 int network_backends_get_rw_ndx(network_backends_t *);
 
 int network_backends_idle_conns(network_backends_t *);
 int network_backends_used_conns(network_backends_t *);
+
+int network_backend_check_available_rw(network_backends_t *, GString *);
 
 #endif /* _BACKEND_H_ */

@@ -2,11 +2,11 @@
 
 ## 环境说明
 
-MySQL建议使用5.7.16以上版本，若使用读写分离功能则需要搭建MySQL主从关系，若使用sharding功能则需要根据业务进行分库设计；创建用户和密码并确认Cetus可以远程登录MySQL。
+MySQL建议使用5.7.16以上版本，若使用读写分离功能则需要搭建MySQL主从关系，若使用sharding功能则需要根据业务进行分库设计；创建用户和密码并确认Cetus可以远程登录MySQL，具体说明详见[Cetus MySQL准备说明](https://github.com/Lede-Inc/cetus/blob/master/doc/cetus-mysql-prepare.md)。
 
 ## 安装
 
-Cetus只支持linux系统，安装步骤参考[Cetus 安装说明](https://github.com/Lede-Inc/cetus/blob/master/doc/cetus-install.md)，配置说明详见[Cetus 配置文件说明](https://github.com/Lede-Inc/cetus/blob/master/doc/cetus-profile.md)。
+Cetus只支持linux系统，安装步骤参考[Cetus 安装说明](https://github.com/Lede-Inc/cetus/blob/master/doc/cetus-install.md)，安装成功后Cetus提供了示例配置文件，在/home/user/cetus_install/conf/目录下，以.example结尾，用户可根据需求进行修改，配置修改根据安装的不同版本详见[Cetus 读写分离版配置文件说明](https://github.com/Lede-Inc/cetus/blob/master/doc/cetus-rw-profile.md)、[Cetus 分库(sharding)版配置文件说明](https://github.com/Lede-Inc/cetus/blob/master/doc/cetus-shard-profile.md)。
 
 ## 部署
 
@@ -14,9 +14,26 @@ Cetus只支持linux系统，安装步骤参考[Cetus 安装说明](https://githu
 
 ## 启动
 
+启动cetus之前，要保证配置文件（proxy.conf/shard.conf）的权限最小为660，可以通过以下命令修改权限：
+```
+chmod 660 proxy.conf
+```
+
+### 1. 命令行启动
 ```
 bin/cetus --defaults-file=conf/proxy.conf|shard.conf [--conf-dir＝/home/user/cetus_install/conf/]
 ```
+
+### 2. service命令启动
+
+源码路径下的scripts文件夹中的cetus.service文件提供了启动、关闭cetus的脚本，CentOS系统下的用户可以将其拷贝至系统/etc/init.d/目录下，将其改名为cetus，并将其CETUS_HOME修改成cetus的实际安装路径，同时根据安装的cetus的读写分离版本或是分库版本，修改CETUS_CONF。使用该脚本对cetus操作的命令如下：
+
+```
+service cetus start
+service cetus stop
+service cetus restart
+```
+
 
 ## 连接
 
@@ -37,9 +54,43 @@ Cetus对外暴露两类端口：proxy｜shard端口和admin端口。proxy｜shar
 
 ### 2. 连接Cetus管理端口
 
+**2.1 mysql客户端连接**
+
 ```
    $  mysql --prompt="admin> " --comments -h**.**.**.** -P**** -u**** -p***
-   admin> select * from backends；
+   admin> show maintain status；
+```
+
+**2.2 Python连接**
+
+支持Python的pymysql模块和MySQLdb模块连接管理端口。
+
+- pymysql：
+
+**注意：需要设置链接参数 autocommit=None**
+```
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+import pymysql as connector
+
+conn = connector.connect(host="127.0.0.1", user="admin", passwd="admin", port=6666, autocommit=None )
+cursor = conn.cursor()
+cursor.execute("show maintain status")
+data = cursor.fetchone()
+print "maintain status: %s" % data
+```
+
+- MySQLdb：
+```
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+import MySQLdb as connector
+
+conn = connector.connect(host="127.0.0.1", user="admin", passwd="admin", port=6666)
+cursor = conn.cursor()
+cursor.execute("show maintain status")
+data = cursor.fetchone()
+print "maintain status: %s" % data
 ```
 
 可以使用在配置文件中的admin用户名和密码，登陆地址为admin-address的mysql对Cetus进行管理，例如在查询Cetus的后端详细信息时，可以登录后通过命令 select * from backends，显示后端端口的地址、状态、读写类型，以及读写延迟时间和连接数等信息。
@@ -47,3 +98,18 @@ Cetus对外暴露两类端口：proxy｜shard端口和admin端口。proxy｜shar
 具体使用说明根据版本情况详见[Cetus 读写分离版管理手册](https://github.com/Lede-Inc/cetus/blob/master/doc/cetus-rw-admin.md)、[Cetus 分库(sharding)版管理手册](https://github.com/Lede-Inc/cetus/blob/master/doc/cetus-shard-admin.md)
 
 **注：Cetus读写分离和分库两个版本的使用约束详见[Cetus 使用约束说明](https://github.com/Lede-Inc/cetus/blob/master/doc/cetus-constraint.md)**
+
+## MySQL8 支持
+
+由于MySQL8.0用户权限认证插件新增了caching\_sha2\_password，并且默认创建的用户权限认证插件为该插件，MySQL55/56/57不支持该认证方式。因此在使用MySQL55/56/57库编译的Cetus时，配置default\-username账号，应该在MySQL上创建时指定插件为mysql|_native|_password，否则Cetus的监控线程无法工作，影响Cetus的正常使用。
+
+配置方法示例如下：
+
+```
+create user 'default-user'@'%' identified with mysql_native_password by 'my_password';
+grant all privileges on *.* to 'default-user'@'%';
+```
+
+## 特别注意
+
+在使用cetus的时候，**不要**将后端MySQL的全局autocommit模式设置为OFF/0。如果需要使用隐式提交，可以在业务端配置该参数，例如在Java客户端的jdbcUrl中配置autoCommit=false。

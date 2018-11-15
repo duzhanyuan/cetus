@@ -31,13 +31,15 @@
 #include "network-mysqld-proto.h"
 #include "resultset_merge.h"
 #include "plugin-common.h"
+#include "network-mysqld-packet.h"
+#include "chassis-sql-log.h"
 
 void
 server_session_free(server_session_t *ss)
 {
     if (ss) {
         if (ss->server != NULL) {
-            network_socket_free(ss->server);
+            network_socket_send_quit_and_free(ss->server);
         }
 
         ss->sql = NULL;
@@ -52,6 +54,23 @@ server_sess_wait_for_event(server_session_t *ss, short ev_type, struct timeval *
     event_set(&(ss->server->event), ss->server->fd, ev_type, server_session_con_handler, ss);
     chassis_event_add_with_timeout(ss->con->srv, &(ss->server->event), timeout);
     ss->server->is_waiting = 1;
+}
+
+static int
+remove_server_wait_event(network_mysqld_con *con)
+{
+    int i, result = 0;
+    for (i = 0; i < con->servers->len; i++) {
+        server_session_t *ss = (server_session_t *)g_ptr_array_index(con->servers, i);
+        network_socket *server = ss->server;
+        if (server->is_waiting) {
+            g_message("%s: still wait server resp here", G_STRLOC);
+            CHECK_PENDING_EVENT(&(server->event));
+            result = 1;
+        }
+    }
+
+    return result;
 }
 
 static void
@@ -90,6 +109,9 @@ do_tcp_stream_after_recv_resp(network_mysqld_con *con, server_session_t *ss)
             network_mysqld_con_handle(-1, 0, con);
         } else {
             if (callback_merge(con, con->data, 0) == RM_FAIL) {
+                if (remove_server_wait_event(con)) {
+                    g_critical("%s: remove read pending event:%p", G_STRLOC, con);
+                }
                 network_queue_clear(con->client->send_queue);
                 network_mysqld_con_send_error_full(con->client, C("merge failed"), ER_CETUS_RESULT_MERGE, "HY000");
                 con->state = ST_SEND_QUERY_RESULT;
@@ -97,6 +119,7 @@ do_tcp_stream_after_recv_resp(network_mysqld_con *con, server_session_t *ss)
             }
         }
     } else {
+        remove_server_wait_event(con);
         g_message("%s: resp too long:%p, src port:%s, sql:%s",
                   G_STRLOC, con, con->client->src->name->str, con->orig_sql->str);
         network_mysqld_con_send_error_full(con->client, C("response too long for proxy"), ER_CETUS_LONG_RESP, "HY000");
@@ -221,7 +244,7 @@ process_write_event(network_mysqld_con *con, server_session_t *ss)
 {
     network_socket *sock = ss->server;
 
-    switch (network_mysqld_write(con->srv, sock)) {
+    switch (network_mysqld_write(sock)) {
     case NETWORK_SOCKET_SUCCESS:
         con->num_pending_servers++;
         con->num_servers_visited++;
@@ -243,6 +266,8 @@ process_write_event(network_mysqld_con *con, server_session_t *ss)
         char *msg = "write error";
         con->state = ST_SEND_QUERY_RESULT;
         con->server_to_be_closed = 1;
+        con->dist_tran = 0;
+        con->is_client_to_be_closed = 1;
         g_warning("%s:write error for con:%p", G_STRLOC, con);
         network_mysqld_con_send_error_full(con->client, L(msg), ER_NET_ERROR_ON_WRITE, "08S01");
         network_mysqld_con_handle(-1, 0, con);
@@ -259,7 +284,6 @@ process_read_server(network_mysqld_con *con, server_session_t *ss)
     int ret = 0;
 
     network_socket *sock = ss->server;
-
     if (sock->to_read == 0) {
         sock->is_closed = 1;
         is_finished = 1;
@@ -279,6 +303,14 @@ process_read_server(network_mysqld_con *con, server_session_t *ss)
             ss->state = NET_RW_STATE_FINISHED;
             ss->server->is_read_finished = 1;
             ss->server->is_waiting = 0;
+            if (con->srv->sql_mgr && con->srv->sql_mgr->sql_log_switch == ON) {
+                ss->ts_read_query_result_last = get_timer_microseconds();
+                network_mysqld_com_query_result_t *query = con->parse.data;
+                if (query && query->query_status == MYSQLD_PACKET_ERR) {
+                    ss->query_status = MYSQLD_PACKET_ERR;
+                }
+                log_sql_backend_sharding(con, ss);
+            }
         } else {
             if (con->candidate_tcp_streamed && con->num_servers_visited > 1) {
                 set_conn_attr(con, ss->server);
@@ -322,9 +354,6 @@ process_read_server(network_mysqld_con *con, server_session_t *ss)
             if (con->candidate_tcp_streamed && sock->max_header_size_reached && con->num_servers_visited > 1) {
                 g_debug("%s: set NET_RW_STATE_PART_FINISHED here", G_STRLOC);
                 ss->state = NET_RW_STATE_PART_FINISHED;
-                if (con->partially_merged) {
-                    do_tcp_stream_after_recv_resp(con, ss);
-                }
                 break;
             } else {
                 if (con->num_servers_visited == 1 && sock->max_header_size_reached && con->candidate_tcp_streamed) {
@@ -378,6 +407,7 @@ process_after_read(network_mysqld_con *con, server_session_t *ss)
 void
 server_session_con_handler(int event_fd, short events, void *user_data)
 {
+    g_debug("%s:visit server_session_con_handler", G_STRLOC);
     server_session_t *ss = (server_session_t *)user_data;
     network_mysqld_con *con = ss->con;
     network_socket *sock = ss->server;
